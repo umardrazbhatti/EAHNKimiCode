@@ -2,13 +2,13 @@
 scripts/train_real.py — Phase 2 GPU training on FF++/Celeb-DF/DFDC.
 
 FIXES vs previous version:
-  1. Backbone freezing for first N epochs (prevents BN corruption with small batches).
-  2. Removed cls_dropout dependency (was causing train/test mismatch).
-  3. Added gradient-alignment loss (forces M_t to correlate with input gradients).
-  4. Explanation loss now receives labels → class-conditional diversity penalty.
-  5. Focal loss + label smoothing + WeightedRandomSampler = triple imbalance defence.
-  6. Per-class accuracy logging to verify sampler is actually balancing.
-  7. Autocast context manager fixed (already correct, preserved).
+ 1. Backbone freezing for first N epochs (prevents BN corruption with small batches).
+ 2. Removed cls_dropout dependency (was causing train/test mismatch).
+ 3. Added gradient-alignment loss (forces M_t to correlate with input gradients).
+ 4. Explanation loss now receives labels → class-conditional diversity penalty.
+ 5. Focal loss + label smoothing + WeightedRandomSampler = triple imbalance defence.
+ 6. Per-class accuracy logging to verify sampler is actually balancing.
+ 7. Autocast context manager fixed (already correct, preserved).
 """
 
 import os
@@ -34,24 +34,24 @@ def main(config: EAHNConfig):
     device = torch.device(config.device)
     print(f"Using device: {device}")
     if device.type == "cuda":
-        cap  = torch.cuda.get_device_capability(device)
+        cap = torch.cuda.get_device_capability(device)
         name = torch.cuda.get_device_name(device)
         print(f"[Device] {name} | CUDA capability sm_{cap[0]}{cap[1]}")
         if cap[0] < 7:
             print(
                 f"[WARNING] sm_{cap[0]}{cap[1]} is below PyTorch minimum "
                 f"(sm_70). Switch Kaggle accelerator to T4. "
-                f"Falling back to CPU for MTCNN. AMP disabled."
+                "Falling back to CPU for MTCNN. AMP disabled."
             )
     os.makedirs(config.output_dir, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_ds = DeepfakeDataset(config, "train", config.dataset_name)
-    val_ds   = DeepfakeDataset(config, "val",   config.dataset_name)
+    val_ds = DeepfakeDataset(config, "val", config.dataset_name)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    labels_arr    = np.array([s["label"] for s in train_ds.samples], dtype=int)
-    class_counts  = np.bincount(labels_arr, minlength=2)
+    labels_arr = np.array([s["label"] for s in train_ds.samples], dtype=int)
+    class_counts = np.bincount(labels_arr, minlength=2)
     class_weights = 1.0 / np.maximum(class_counts, 1)
     sample_weights = class_weights[labels_arr]
     sampler = WeightedRandomSampler(
@@ -85,7 +85,7 @@ def main(config: EAHNConfig):
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model     = EAHN(config).to(device)
+    model = EAHN(config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
@@ -98,8 +98,8 @@ def main(config: EAHNConfig):
         and device.type == "cuda"
         and torch.cuda.get_device_capability(device)[0] >= 7
     )
-    scaler  = GradScaler("cuda") if use_amp else None
-    logger  = Logger(config.output_dir)
+    scaler = GradScaler("cuda") if use_amp else None
+    logger = Logger(config.output_dir)
 
     # ── Progressive backbone freezing ─────────────────────────────────────────
     if config.freeze_backbone:
@@ -108,16 +108,16 @@ def main(config: EAHNConfig):
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
-    best_auc    = -1.0
+    best_auc = -1.0
     if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
         ckpt = load_checkpoint(config.resume_checkpoint, model, optimizer, scheduler)
         start_epoch = ckpt.get("epoch", 0) + 1
-        best_auc    = ckpt.get("best_metric", 0.0)
+        best_auc = ckpt.get("best_metric", 0.0)
         print(f"Resumed from epoch {start_epoch}, best AUC {best_auc:.4f}")
 
     # ── Losses ────────────────────────────────────────────────────────────────
-    cls_loss_fn  = build_classification_loss(config)
-    exp_loss_fn  = ExplanationLoss(
+    cls_loss_fn = build_classification_loss(config)
+    exp_loss_fn = ExplanationLoss(
         alpha=config.alpha,
         beta=config.beta,
         diversity_weight=config.attn_diversity_weight,
@@ -139,7 +139,7 @@ def main(config: EAHNConfig):
             print(f"[Backbone] Unfrozen at epoch {epoch}")
             # Reduce LR for backbone to avoid catastrophic forgetting
             for param_group in optimizer.param_groups:
-                param_group['lr'] = param_group['lr'] * 0.1
+                param_group["lr"] = param_group["lr"] * 0.1
 
         model.train()
         running_loss = 0.0
@@ -147,24 +147,24 @@ def main(config: EAHNConfig):
 
         # Per-class counters for this epoch
         epoch_real_correct = 0
-        epoch_real_total   = 0
+        epoch_real_total = 0
         epoch_fake_correct = 0
-        epoch_fake_total   = 0
+        epoch_fake_total = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            frames   = batch["frames"].to(device)
-            labels   = batch["label"].to(device)
-            masks    = batch["mask"].to(device)
+            frames = batch["frames"].to(device)
+            labels = batch["label"].to(device)
+            masks = batch["mask"].to(device)
             has_mask = batch["has_mask"].to(device)
 
             ctx = autocast("cuda") if use_amp else contextlib.nullcontext()
 
             with ctx:
-                out      = model(frames)
-                l_cls    = cls_loss_fn(out.logit, labels)
-                exp_out  = exp_loss_fn(out.M_t, masks, has_mask, labels=labels)
-                l_exp    = exp_out.loss
-                l_temp   = temp_loss_fn(out.M_t, out.low_level)
+                out = model(frames)
+                l_cls = cls_loss_fn(out.logit, labels)
+                exp_out = exp_loss_fn(out.M_t, masks, has_mask, labels=labels)
+                l_exp = exp_out.loss
+                l_temp = temp_loss_fn(out.M_t, out.low_level)
 
                 # Gradient alignment — computed every 5 batches to save compute
                 l_grad_align = torch.tensor(0.0, device=device)
@@ -196,7 +196,7 @@ def main(config: EAHNConfig):
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
-                optimizer.zero_grad()
+                    optimizer.zero_grad()
 
             # Per-class accuracy tracking
             with torch.no_grad():
@@ -205,10 +205,10 @@ def main(config: EAHNConfig):
                 fake_mask = (labels == 1)
                 if real_mask.any():
                     epoch_real_correct += (preds[real_mask] == labels[real_mask]).sum().item()
-                    epoch_real_total   += real_mask.sum().item()
+                    epoch_real_total += real_mask.sum().item()
                 if fake_mask.any():
                     epoch_fake_correct += (preds[fake_mask] == labels[fake_mask]).sum().item()
-                    epoch_fake_total   += fake_mask.sum().item()
+                    epoch_fake_total += fake_mask.sum().item()
 
             if epoch == 0 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
@@ -220,15 +220,15 @@ def main(config: EAHNConfig):
                 _live_tau = model.cross_attention.log_temp.exp().item()
                 print(
                     f"[LIVE E{epoch+1} B{batch_idx:03d}] "
-                    f"M_t_std={_live_std:.3f}  "
-                    f"tau={_live_tau:.2f}  "
-                    f"L_cls={l_cls.item():.2f}  "
-                    f"L_H={exp_out.l_h:.2f}  "
-                    f"L_TV={exp_out.l_tv:.2f}  "
-                    f"L_div={exp_out.l_div:.2f}  "
-                    f"L_class_sep={exp_out.l_class_sep:.2f}  "
-                    f"L_temp={l_temp.item():.4f}  "
-                    f"L_grad={l_grad_align.item():.4f}  "
+                    f"M_t_std={_live_std:.3f} "
+                    f"tau={_live_tau:.2f} "
+                    f"L_cls={l_cls.item():.2f} "
+                    f"L_H={exp_out.l_h:.2f} "
+                    f"L_TV={exp_out.l_tv:.2f} "
+                    f"L_div={exp_out.l_div:.2f} "
+                    f"L_class_sep={exp_out.l_class_sep:.2f} "
+                    f"L_temp={l_temp.item():.4f} "
+                    f"L_grad={l_grad_align.item():.4f} "
                     f"sample_sim={exp_out.inter_sample_sim:.2f}"
                 )
 
@@ -248,7 +248,10 @@ def main(config: EAHNConfig):
         # Epoch-level class-balance report
         real_acc = epoch_real_correct / max(epoch_real_total, 1)
         fake_acc = epoch_fake_correct / max(epoch_fake_total, 1)
-        print(f"[Epoch {epoch+1} Class Acc] Real: {real_acc:.3f} ({epoch_real_correct}/{epoch_real_total})  "
+        print(
+            f"[Epoch {epoch+1} Class Acc] Real: {real_acc:.3f} ({epoch_real_correct}/{epoch_real_total})  "
+            f"Fake: {fake_acc:.3f} ({epoch_fake_correct}/{epoch_fake_total})"
+        )
 
         # ── Log epoch-level training metrics ──────────────────────────────────
         avg_train_loss = running_loss / max(len(train_loader), 1)
@@ -258,7 +261,6 @@ def main(config: EAHNConfig):
             "fake_acc": fake_acc,
             "lr": optimizer.param_groups[0]["lr"],
         }, epoch)
-              f"Fake: {fake_acc:.3f} ({epoch_fake_correct}/{epoch_fake_total})")
 
         # ── Validation ────────────────────────────────────────────────────────
         model.eval()
@@ -266,7 +268,7 @@ def main(config: EAHNConfig):
         with torch.no_grad():
             for batch in val_loader:
                 frames = batch["frames"].to(device)
-                out    = model(frames)
+                out = model(frames)
                 probs_list.extend(out.prob.cpu().tolist())
                 labels_list.extend(batch["label"].cpu().tolist())
 
@@ -299,6 +301,6 @@ def main(config: EAHNConfig):
 
 
 if __name__ == "__main__":
-    args   = parse_args()
+    args = parse_args()
     config = EAHNConfig.from_args(args)
     main(config)
