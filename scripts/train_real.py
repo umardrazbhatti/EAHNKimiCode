@@ -11,6 +11,8 @@ FIXES vs previous version:
  7. lambda1_eff warmup increased 200 → 2000 steps so explanation loss
     does not overwhelm the classifier while attention is still learning.
  8. Per-class accuracy logging preserved.
+ 9. Differential learning rates: backbone gets 0.1× head LR.
+10. Unfreeze LR logic fixed for multi-group optimizer.
 """
 
 import os
@@ -88,9 +90,21 @@ def main(config: EAHNConfig):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EAHN(config).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
-    )
+
+    # FIX: Differential learning rates — backbone gets 0.1× head LR
+    backbone_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if name.startswith("spatial_stream.backbone."):
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    optimizer = torch.optim.AdamW([
+        {"params": backbone_params, "lr": config.lr * 0.1},
+        {"params": head_params, "lr": config.lr},
+    ], weight_decay=config.weight_decay)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.epochs, eta_min=1e-6
     )
@@ -119,10 +133,12 @@ def main(config: EAHNConfig):
 
     # ── Losses ────────────────────────────────────────────────────────────────
     cls_loss_fn = build_classification_loss(config)
+    # FIX: Pass class_sep_weight to ExplanationLoss
     exp_loss_fn = ExplanationLoss(
         alpha=config.alpha,
         beta=config.beta,
         diversity_weight=config.attn_diversity_weight,
+        class_sep_weight=0.5,
     )
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
@@ -139,8 +155,8 @@ def main(config: EAHNConfig):
         if config.freeze_backbone and epoch == config.unfreeze_backbone_epoch:
             model.spatial_stream.set_frozen(False)
             print(f"[Backbone] Unfrozen at epoch {epoch}")
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = param_group["lr"] * 0.1
+            # FIX: Only reduce LR for the backbone param group (group 0)
+            optimizer.param_groups[0]["lr"] = optimizer.param_groups[0]["lr"] * 0.1
 
         model.train()
         running_loss = 0.0
@@ -270,7 +286,7 @@ def main(config: EAHNConfig):
         real_acc = epoch_real_correct / max(epoch_real_total, 1)
         fake_acc = epoch_fake_correct / max(epoch_fake_total, 1)
         print(
-            f"[Epoch {epoch+1} Class Acc] Real: {real_acc:.3f} ({epoch_real_correct}/{epoch_real_total})  "
+            f"[Epoch {epoch+1} Class Acc] Real: {real_acc:.3f} ({epoch_real_correct}/{epoch_real_total}) "
             f"Fake: {fake_acc:.3f} ({epoch_fake_correct}/{epoch_fake_total})"
         )
 

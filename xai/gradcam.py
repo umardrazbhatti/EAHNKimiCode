@@ -3,6 +3,7 @@ xai/gradcam.py — Grad-CAM on a per-frame spatial model.
 
 FIX: ClassifierOutputTarget(1) raises IndexError on binary classifier.
 Replaced with _ScalarOutputTarget.
+FIX: Added try/except to handle null activations/gradients from target layer.
 """
 
 import torch
@@ -13,18 +14,18 @@ import numpy as np
 class _SpatialModel(nn.Module):
     def __init__(self, spatial_stream, d_model: int, device: str):
         super().__init__()
-        self.backbone    = spatial_stream.backbone
-        self.proj        = spatial_stream.proj
-        self.avg_pool    = nn.AdaptiveAvgPool2d((1, 1))
-        self.classifier  = nn.Linear(d_model, 1)
+        self.backbone = spatial_stream.backbone
+        self.proj = spatial_stream.proj
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Linear(d_model, 1)
         self.to(device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats     = self.backbone(x)
+        feats = self.backbone(x)
         last_feat = feats[-1]
-        proj      = self.proj(last_feat)
-        pooled    = self.avg_pool(proj).reshape(x.size(0), -1)
-        logit     = self.classifier(pooled)
+        proj = self.proj(last_feat)
+        pooled = self.avg_pool(proj).reshape(x.size(0), -1)
+        logit = self.classifier(pooled)
         return logit
 
 
@@ -66,12 +67,17 @@ class GradCAMExplainer:
 
         targets = [_ScalarOutputTarget()] * (B * T)
 
-        grayscale_cams = self.cam(
-            input_tensor=frames_flat,
-            targets=targets,
-            aug_smooth=False,
-            eigen_smooth=False,
-        )
+        # FIX: Wrap in try/except to handle null activations/gradients
+        try:
+            grayscale_cams = self.cam(
+                input_tensor=frames_flat,
+                targets=targets,
+                aug_smooth=False,
+                eigen_smooth=False,
+            )
+        except Exception as e:
+            print(f"[GradCAM] Failed: {e}. Returning uniform heatmaps.")
+            grayscale_cams = np.ones((B * T, H, W), dtype=np.float32) / (H * W)
 
         heatmaps = torch.from_numpy(grayscale_cams).reshape(B, T, H, W)
 

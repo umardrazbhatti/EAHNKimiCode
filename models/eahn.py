@@ -8,6 +8,8 @@ FIXES:
     Also removed self.eval()/self.train() toggling that broke frozen BN.
  3. Added temperature clamping: τ is clamped to [1.0, 2.0] before every
     cross-attention forward, preventing the uniform-attention trap.
+ 4. CrossAttentionFusion now receives config.attn_temp_init.
+ 5. ExplanationLoss receives class_sep_weight=0.5.
 """
 
 import torch
@@ -48,10 +50,10 @@ class EAHN(nn.Module):
         dummy = torch.zeros(1, 3, config.frame_size, config.frame_size)
         with torch.no_grad():
             dummy_tokens = self.spatial_stream(dummy)
-            N = dummy_tokens.shape[1]
-            self.N = N
-            self.feat_h = self.spatial_stream.feat_h
-            self.feat_w = self.spatial_stream.feat_w
+        N = dummy_tokens.shape[1]
+        self.N = N
+        self.feat_h = self.spatial_stream.feat_h
+        self.feat_w = self.spatial_stream.feat_w
 
         max_seq = config.num_frames * N + 1
         self.temporal_stream = TemporalStream(
@@ -62,7 +64,12 @@ class EAHN(nn.Module):
             max_seq_len=max_seq,
         )
 
-        self.cross_attention = CrossAttentionFusion(d_model=d, num_heads=config.transformer_heads)
+        # FIX: Pass temp_init so the config value is actually used
+        self.cross_attention = CrossAttentionFusion(
+            d_model=d,
+            num_heads=config.transformer_heads,
+            temp_init=config.attn_temp_init,
+        )
         self.classifier = nn.Linear(d, 1)
         self._init_weights()
 

@@ -41,29 +41,30 @@ class EAHNConfig:
 
     # ── Loss weights ──────────────────────────────────────────────────────────
     lambda1: float = 1.0          # L_exp weight
-    lambda2: float = 0.05         # L_temp weight (reduced to avoid freezing heatmaps)
-    alpha: float = 0.5            # entropy weight — INCREASED to prevent one-hot collapse
+    lambda2: float = 0.02         # FIX: was 0.05 — weaker temporal smoothing
+    alpha: float = 0.5            # entropy weight
     beta: float = 0.5             # TV weight in weak supervision
     gamma: float = 0.1            # gate decay rate in L_temp
-    attn_temp_init: float = 0.0   # FIX: was 1.386 (τ=4.0). Now 0.0 → τ=1.0 (peaked, trainable)
-    attn_diversity_weight: float = 2.5
-    cls_dropout_p: float = 0.0    # DISABLED — caused train/test distribution mismatch
-    lambda_grad_align: float = 0.1  # gradient-alignment loss weight
-    label_smoothing: float = 0.05   # label smoothing for classification
+    attn_temp_init: float = 0.0   # FIX: was 1.386 (τ=4.0). Now 0.0 → τ=1.0
+    attn_diversity_weight: float = 8.0   # FIX: was 2.5 — much stronger diversity
+    cls_dropout_p: float = 0.0    # DISABLED
+    lambda_grad_align: float = 0.1
+    label_smoothing: float = 0.02 # FIX: was 0.05 — sharper decisions
+    class_sep_weight: float = 0.5 # NEW: class-separation loss weight
 
     # ── Backbone freezing ─────────────────────────────────────────────────────
     freeze_backbone: bool = True
     unfreeze_backbone_epoch: int = 3
 
     # ── Classification loss ───────────────────────────────────────────────────
-    cls_loss_type: str = "focal"  # "bce" | "focal"
+    cls_loss_type: str = "focal"
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
 
     # ── Training ──────────────────────────────────────────────────────────────
-    epochs: int = 50
+    epochs: int = 5               # FIX: was 50 — run 5 for this test
     batch_size: int = 4
-    grad_accum_steps: int = 2
+    grad_accum_steps: int = 4     # FIX: was 2 — effective batch size = 16
     lr: float = 1e-4
     weight_decay: float = 1e-2
     mixed_precision: bool = True
