@@ -12,7 +12,6 @@ class ClassificationLoss(nn.Module):
     def forward(self, logit: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         target = label.float()
         if self.label_smoothing > 0:
-            # 0 -> eps, 1 -> 1-eps
             target = target * (1 - self.label_smoothing) + (1 - target) * self.label_smoothing
         return F.binary_cross_entropy_with_logits(logit, target)
 
@@ -20,28 +19,29 @@ class ClassificationLoss(nn.Module):
 class FocalLoss(nn.Module):
     """
     Focal loss for class-imbalanced binary classification.
-    Safe under torch.autocast because it uses BCEWithLogits (no manual sigmoid + BCE).
+    Safe under torch.autocast because it uses BCEWithLogits.
 
-    alpha : weight for positive class (fake). 0.25 down-weights the easy majority.
-    gamma : focusing parameter — higher = more focus on hard examples.
+    FIX: Now accepts label_smoothing (was silently ignored before).
     """
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, label_smoothing: float = 0.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.eps = label_smoothing
 
     def forward(self, logit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Use BCEWithLogits instead of sigmoid + BCE (unsafe under autocast)
-        bce = F.binary_cross_entropy_with_logits(logit, target.float(), reduction='none')
+        target = target.float()
+        if self.eps > 0:
+            target = target * (1 - self.eps) + (1 - target) * self.eps
 
-        # Compute probability for focal weighting
+        bce = F.binary_cross_entropy_with_logits(logit, target, reduction='none')
+
         with torch.no_grad():
             prob = torch.sigmoid(logit)
-            pt = torch.where(target.bool(), prob, 1 - prob)
+            pt = torch.where(target > 0.5, prob, 1 - prob)
             focal_weight = self.alpha * (1 - pt).pow(self.gamma)
 
-        focal = focal_weight * bce
-        return focal.mean()
+        return (focal_weight * bce).mean()
 
 
 def build_classification_loss(config) -> nn.Module:
@@ -50,5 +50,6 @@ def build_classification_loss(config) -> nn.Module:
         return FocalLoss(
             alpha=getattr(config, "focal_alpha", 0.25),
             gamma=getattr(config, "focal_gamma", 2.0),
+            label_smoothing=getattr(config, 'label_smoothing', 0.0),
         )
     return ClassificationLoss(label_smoothing=getattr(config, 'label_smoothing', 0.0))

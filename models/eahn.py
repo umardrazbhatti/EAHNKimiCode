@@ -1,10 +1,13 @@
 """
 models/eahn.py — Explanation-Aware Hybrid Network (EAHN).
 
-FIXES vs previous version:
-  1. Removed cls_dropout (caused train/test distribution mismatch → constant predictions).
-  2. Added compute_gradient_saliency() for gradient-alignment loss.
-  3. Backbone freezing controlled via config.freeze_backbone.
+FIXES:
+ 1. Removed cls_dropout (caused train/test distribution mismatch).
+ 2. compute_gradient_saliency() now uses torch.autograd.grad instead of
+    .backward(), preventing gradient contamination of model parameters.
+    Also removed self.eval()/self.train() toggling that broke frozen BN.
+ 3. Added temperature clamping: τ is clamped to [1.0, 2.0] before every
+    cross-attention forward, preventing the uniform-attention trap.
 """
 
 import torch
@@ -20,11 +23,11 @@ from models.cross_attention import CrossAttentionFusion
 
 @dataclass
 class EAHNOutput:
-    logit:     torch.Tensor
-    prob:      torch.Tensor
-    M_t:       torch.Tensor
-    M_t_up:    torch.Tensor
-    S:         torch.Tensor
+    logit: torch.Tensor
+    prob: torch.Tensor
+    M_t: torch.Tensor
+    M_t_up: torch.Tensor
+    S: torch.Tensor
     low_level: torch.Tensor
     attn_pool: torch.Tensor
 
@@ -45,10 +48,10 @@ class EAHN(nn.Module):
         dummy = torch.zeros(1, 3, config.frame_size, config.frame_size)
         with torch.no_grad():
             dummy_tokens = self.spatial_stream(dummy)
-        N = dummy_tokens.shape[1]
-        self.N      = N
-        self.feat_h = self.spatial_stream.feat_h
-        self.feat_w = self.spatial_stream.feat_w
+            N = dummy_tokens.shape[1]
+            self.N = N
+            self.feat_h = self.spatial_stream.feat_h
+            self.feat_w = self.spatial_stream.feat_w
 
         max_seq = config.num_frames * N + 1
         self.temporal_stream = TemporalStream(
@@ -79,10 +82,15 @@ class EAHN(nn.Module):
         C_low, Hl, Wl = low_feat.shape[1], low_feat.shape[2], low_feat.shape[3]
 
         spatial_tokens = spatial_tokens.view(B, T, N, d)
-        low_level      = low_feat.view(B, T, C_low, Hl, Wl)
+        low_level = low_feat.view(B, T, C_low, Hl, Wl)
 
         Q, cls_out = self.temporal_stream(spatial_tokens.reshape(B, T * N, d))
         Q = Q.reshape(B, T, N, d)
+
+        # FIX: Clamp temperature to prevent uniform attention trap (τ ∈ [1.0, 2.0])
+        if hasattr(self.cross_attention, 'log_temp'):
+            with torch.no_grad():
+                self.cross_attention.log_temp.clamp_(0.0, 0.693)
 
         M_t, attn_pool = self.cross_attention(Q, spatial_tokens)
 
@@ -93,11 +101,9 @@ class EAHN(nn.Module):
             align_corners=False,
         ).reshape(B, T, H, W)
 
-        # REMOVED: cls_dropout — it created a train/test distribution mismatch.
-        # The model now always uses the same feature composition at train and test time.
         final_feat = cls_out + attn_pool
         logit = self.classifier(final_feat).squeeze(-1)
-        prob  = torch.sigmoid(logit)
+        prob = torch.sigmoid(logit)
 
         return EAHNOutput(
             logit=logit, prob=prob,
@@ -109,21 +115,29 @@ class EAHN(nn.Module):
     def compute_gradient_saliency(self, frames: torch.Tensor):
         """
         Compute input-gradient saliency maps at the same resolution as M_t.
-        Used for gradient-alignment loss (P2 fix).
+        FIX: Uses torch.autograd.grad instead of .backward() to avoid
+        contaminating model parameter gradients. No eval/train toggling.
         """
         B, T, C, H, W = frames.shape
-        frames_grad = frames.clone().detach().requires_grad_(True)
-        self.eval()
+        frames_grad = frames.detach().clone().requires_grad_(True)
+
         with torch.enable_grad():
             out = self(frames_grad)
-            out.logit.backward(torch.ones_like(out.logit))
-        grad = frames_grad.grad.abs().mean(dim=2)  # (B, T, H, W)
+            grad_outputs = torch.ones_like(out.logit)
+            grads = torch.autograd.grad(
+                outputs=out.logit,
+                inputs=frames_grad,
+                grad_outputs=grad_outputs,
+                create_graph=False,
+                retain_graph=False,
+            )[0]
+
+        grad = grads.abs().mean(dim=2)  # (B, T, H, W)
         grad_7 = F.interpolate(
             grad.reshape(B * T, 1, H, W),
             size=(self.feat_h, self.feat_w),
             mode="bilinear",
             align_corners=False,
         ).reshape(B, T, self.feat_h, self.feat_w)
-        frames_grad.requires_grad_(False)
-        self.train()
+
         return grad_7.detach()

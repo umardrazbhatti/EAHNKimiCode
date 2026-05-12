@@ -1,7 +1,9 @@
 """
 models/spatial_stream.py — EfficientNet/ConvNeXt backbone wrapper.
 
-FIX: Added set_frozen() / unfreeze() methods for progressive backbone unfreezing.
+FIX: set_frozen() now forces BN layers into eval() mode and disables
+running-stat tracking when frozen. This prevents BatchNorm corruption
+with batch_size=4, which was the root cause of the Epoch-2 NaN cascade.
 """
 
 import torch
@@ -44,9 +46,23 @@ class SpatialStream(nn.Module):
         self.feat_w: int = None
 
     def set_frozen(self, freeze: bool):
-        """Freeze or unfreeze all backbone parameters."""
+        """
+        Freeze or unfreeze backbone parameters.
+        CRITICAL FIX: When frozen, BN layers are forced to eval() mode and
+        track_running_stats is disabled. This prevents running mean/var
+        corruption caused by batch_size=4.
+        """
         for p in self.backbone.parameters():
             p.requires_grad = not freeze
+
+        for m in self.backbone.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                if freeze:
+                    m.eval()
+                    m.track_running_stats = False
+                else:
+                    m.train()
+                    m.track_running_stats = True
 
     @property
     def grad_cam_target_layer(self):
@@ -63,10 +79,10 @@ class SpatialStream(nn.Module):
                 low = self.low_level_extractor(frames)
             else:
                 low = self.backbone(frames)[0]
-        self._cached_low_level = low.detach()
+            self._cached_low_level = low.detach()
 
         feats = self.backbone(frames)
-        last  = feats[-1]
+        last = feats[-1]
         self.feat_h, self.feat_w = last.shape[-2], last.shape[-1]
 
         proj = self.proj(last)

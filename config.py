@@ -1,6 +1,11 @@
 """
 config.py — single source of truth for all EAHN hyperparameters.
 CLI overrides via argparse; no hardcoded paths anywhere else.
+
+FIX: attn_temp_init changed from 1.386 (τ=4.0) to 0.0 (τ=1.0).
+A temperature of 4.0 forces uniform attention maps (M_t ≈ 1/49 everywhere),
+which creates a flat loss landscape with zero gradients for the temperature
+parameter — the "uniform attention trap" that locked τ at 4.0 forever.
 """
 
 import argparse
@@ -35,24 +40,24 @@ class EAHNConfig:
     dropout: float = 0.1
 
     # ── Loss weights ──────────────────────────────────────────────────────────
-    lambda1: float = 1.0   # L_exp weight
-    lambda2: float = 0.05  # L_temp weight (reduced to avoid freezing heatmaps)
-    alpha: float = 0.5     # entropy weight — INCREASED to prevent one-hot collapse
-    beta: float = 0.5      # TV weight in weak supervision
-    gamma: float = 0.1     # gate decay rate in L_temp
-    attn_temp_init: float = 1.386   # log(4.0)
+    lambda1: float = 1.0          # L_exp weight
+    lambda2: float = 0.05         # L_temp weight (reduced to avoid freezing heatmaps)
+    alpha: float = 0.5            # entropy weight — INCREASED to prevent one-hot collapse
+    beta: float = 0.5             # TV weight in weak supervision
+    gamma: float = 0.1            # gate decay rate in L_temp
+    attn_temp_init: float = 0.0   # FIX: was 1.386 (τ=4.0). Now 0.0 → τ=1.0 (peaked, trainable)
     attn_diversity_weight: float = 2.5
-    cls_dropout_p: float = 0.0      # DISABLED — caused train/test distribution mismatch
-    lambda_grad_align: float = 0.1  # NEW: gradient-alignment loss weight
-    label_smoothing: float = 0.05   # NEW: label smoothing for classification
+    cls_dropout_p: float = 0.0    # DISABLED — caused train/test distribution mismatch
+    lambda_grad_align: float = 0.1  # gradient-alignment loss weight
+    label_smoothing: float = 0.05   # label smoothing for classification
 
     # ── Backbone freezing ─────────────────────────────────────────────────────
     freeze_backbone: bool = True
     unfreeze_backbone_epoch: int = 3
 
     # ── Classification loss ───────────────────────────────────────────────────
-    cls_loss_type: str = "focal"   # "bce" | "focal"  — focal handles imbalance better
-    focal_alpha: float = 0.25      # down-weights easy majority (fake) class
+    cls_loss_type: str = "focal"  # "bce" | "focal"
+    focal_alpha: float = 0.25
     focal_gamma: float = 2.0
 
     # ── Training ──────────────────────────────────────────────────────────────

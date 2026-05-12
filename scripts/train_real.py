@@ -2,13 +2,15 @@
 scripts/train_real.py — Phase 2 GPU training on FF++/Celeb-DF/DFDC.
 
 FIXES vs previous version:
- 1. Backbone freezing for first N epochs (prevents BN corruption with small batches).
- 2. Removed cls_dropout dependency (was causing train/test mismatch).
- 3. Added gradient-alignment loss (forces M_t to correlate with input gradients).
- 4. Explanation loss now receives labels → class-conditional diversity penalty.
- 5. Focal loss + label smoothing + WeightedRandomSampler = triple imbalance defence.
- 6. Per-class accuracy logging to verify sampler is actually balancing.
- 7. Autocast context manager fixed (already correct, preserved).
+ 1. Backbone freezing now freezes BN stats (prevents NaN cascade).
+ 2. Removed cls_dropout dependency.
+ 3. Gradient-alignment loss fixed (no .backward() contamination).
+ 4. Temperature clamped to [1.0, 2.0] (escapes uniform trap).
+ 5. Focal loss now uses label smoothing.
+ 6. NaN/Inf guards on model outputs and loss — skip bad batches.
+ 7. lambda1_eff warmup increased 200 → 2000 steps so explanation loss
+    does not overwhelm the classifier while attention is still learning.
+ 8. Per-class accuracy logging preserved.
 """
 
 import os
@@ -137,7 +139,6 @@ def main(config: EAHNConfig):
         if config.freeze_backbone and epoch == config.unfreeze_backbone_epoch:
             model.spatial_stream.set_frozen(False)
             print(f"[Backbone] Unfrozen at epoch {epoch}")
-            # Reduce LR for backbone to avoid catastrophic forgetting
             for param_group in optimizer.param_groups:
                 param_group["lr"] = param_group["lr"] * 0.1
 
@@ -145,7 +146,6 @@ def main(config: EAHNConfig):
         running_loss = 0.0
         optimizer.zero_grad()
 
-        # Per-class counters for this epoch
         epoch_real_correct = 0
         epoch_real_total = 0
         epoch_fake_correct = 0
@@ -161,25 +161,47 @@ def main(config: EAHNConfig):
 
             with ctx:
                 out = model(frames)
+
+                # ── NaN/Inf guard on model outputs ──────────────────────────
+                if (torch.isnan(out.logit).any() or torch.isinf(out.logit).any() or
+                    torch.isnan(out.M_t).any() or torch.isinf(out.M_t).any()):
+                    print(
+                        f"[WARNING] NaN/Inf in model outputs at "
+                        f"E{epoch+1}B{batch_idx}. Skipping batch."
+                    )
+                    optimizer.zero_grad()
+                    continue
+
                 l_cls = cls_loss_fn(out.logit, labels)
                 exp_out = exp_loss_fn(out.M_t, masks, has_mask, labels=labels)
                 l_exp = exp_out.loss
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
 
-                # Gradient alignment — computed every 5 batches to save compute
                 l_grad_align = torch.tensor(0.0, device=device)
                 if config.lambda_grad_align > 0 and batch_idx % 5 == 0:
                     grad_saliency = model.compute_gradient_saliency(frames)
                     l_grad_align = torch.nn.functional.mse_loss(out.M_t, grad_saliency)
 
                 _global_step = epoch * len(train_loader) + batch_idx
-                _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
+                # FIX: Warmup increased from 200 → 2000 steps so L_exp ramps slowly
+                _lambda1_eff = config.lambda1 * min(1.0, _global_step / 2000.0)
                 l_total = (
                     l_cls
                     + _lambda1_eff * l_exp
                     + config.lambda2 * l_temp
                     + config.lambda_grad_align * l_grad_align
                 )
+
+                # ── NaN/Inf guard on loss ───────────────────────────────────
+                if torch.isnan(l_total) or torch.isinf(l_total):
+                    print(
+                        f"[WARNING] NaN/Inf loss at E{epoch+1}B{batch_idx}. "
+                        f"L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f}. "
+                        "Skipping batch."
+                    )
+                    optimizer.zero_grad()
+                    continue
+
                 loss = l_total / config.grad_accum_steps
 
             if use_amp:
@@ -190,13 +212,13 @@ def main(config: EAHNConfig):
             if (batch_idx + 1) % config.grad_accum_steps == 0:
                 if use_amp:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if use_amp:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
-                    optimizer.zero_grad()
+                optimizer.zero_grad()
 
             # Per-class accuracy tracking
             with torch.no_grad():
@@ -245,7 +267,6 @@ def main(config: EAHNConfig):
 
         scheduler.step()
 
-        # Epoch-level class-balance report
         real_acc = epoch_real_correct / max(epoch_real_total, 1)
         fake_acc = epoch_fake_correct / max(epoch_fake_total, 1)
         print(
@@ -253,7 +274,6 @@ def main(config: EAHNConfig):
             f"Fake: {fake_acc:.3f} ({epoch_fake_correct}/{epoch_fake_total})"
         )
 
-        # ── Log epoch-level training metrics ──────────────────────────────────
         avg_train_loss = running_loss / max(len(train_loader), 1)
         logger.log_scalars("train", {
             "loss": avg_train_loss,
@@ -280,7 +300,6 @@ def main(config: EAHNConfig):
             f"F1: {metrics['f1']:.4f}"
         )
 
-        # Save best
         val_auc = metrics.get("auc_roc", float("nan"))
         if not math.isnan(val_auc) and val_auc > best_auc:
             best_auc = val_auc
