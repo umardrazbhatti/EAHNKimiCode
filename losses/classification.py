@@ -12,7 +12,7 @@ class ClassificationLoss(nn.Module):
     def forward(self, logit: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         target = label.float()
         if self.label_smoothing > 0:
-            # 0 → eps, 1 → 1-eps
+            # 0 -> eps, 1 -> 1-eps
             target = target * (1 - self.label_smoothing) + (1 - target) * self.label_smoothing
         return F.binary_cross_entropy_with_logits(logit, target)
 
@@ -20,6 +20,8 @@ class ClassificationLoss(nn.Module):
 class FocalLoss(nn.Module):
     """
     Focal loss for class-imbalanced binary classification.
+    Safe under torch.autocast because it uses BCEWithLogits (no manual sigmoid + BCE).
+
     alpha : weight for positive class (fake). 0.25 down-weights the easy majority.
     gamma : focusing parameter — higher = more focus on hard examples.
     """
@@ -29,10 +31,16 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, logit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        prob = torch.sigmoid(logit)
-        bce  = F.binary_cross_entropy(prob, target.float(), reduction='none')
-        pt   = torch.where(target.bool(), prob, 1 - prob)
-        focal = self.alpha * (1 - pt).pow(self.gamma) * bce
+        # Use BCEWithLogits instead of sigmoid + BCE (unsafe under autocast)
+        bce = F.binary_cross_entropy_with_logits(logit, target.float(), reduction='none')
+
+        # Compute probability for focal weighting
+        with torch.no_grad():
+            prob = torch.sigmoid(logit)
+            pt = torch.where(target.bool(), prob, 1 - prob)
+            focal_weight = self.alpha * (1 - pt).pow(self.gamma)
+
+        focal = focal_weight * bce
         return focal.mean()
 
 
