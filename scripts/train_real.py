@@ -13,6 +13,12 @@ FIXES vs previous version:
  8. Per-class accuracy logging preserved.
  9. Differential learning rates: backbone gets 0.1× head LR.
 10. Unfreeze LR logic fixed for multi-group optimizer.
+11. FIX: scheduler.base_lrs updated on unfreeze so CosineAnnealingLR
+    respects the reduced backbone LR.
+12. FIX: torch.cuda.empty_cache() before unfreeze to prevent OOM.
+13. FIX: step leftover gradients at end of epoch to prevent stale grads.
+14. FIX: wrap unfreeze in try/except with clear diagnostics.
+15. FIX: cumulative 100-batch logging to prevent Kaggle log bloat.
 """
 
 import os
@@ -133,7 +139,6 @@ def main(config: EAHNConfig):
 
     # ── Losses ────────────────────────────────────────────────────────────────
     cls_loss_fn = build_classification_loss(config)
-    # FIX: Pass class_sep_weight to ExplanationLoss
     exp_loss_fn = ExplanationLoss(
         alpha=config.alpha,
         beta=config.beta,
@@ -151,12 +156,24 @@ def main(config: EAHNConfig):
     batch_w = len(str(total_batches))
 
     for epoch in range(start_epoch, config.epochs):
-        # Unfreeze backbone at scheduled epoch
+        # ── Unfreeze backbone at scheduled epoch ─────────────────────────────
         if config.freeze_backbone and epoch == config.unfreeze_backbone_epoch:
-            model.spatial_stream.set_frozen(False)
-            print(f"[Backbone] Unfrozen at epoch {epoch}")
-            # FIX: Only reduce LR for the backbone param group (group 0)
-            optimizer.param_groups[0]["lr"] = optimizer.param_groups[0]["lr"] * 0.1
+            print(f"[Backbone] Preparing to unfreeze at epoch {epoch} ...")
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                print(f"[VRAM] Cached before empty: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+            try:
+                model.spatial_stream.set_frozen(False)
+                print(f"[Backbone] Unfrozen at epoch {epoch}")
+            except Exception as e:
+                raise RuntimeError(f"set_frozen(False) failed: {e}")
+
+            old_lr = optimizer.param_groups[0]["lr"]
+            new_lr = old_lr * 0.1
+            optimizer.param_groups[0]["lr"] = new_lr
+            scheduler.base_lrs[0] = new_lr
+            print(f"[LR] Backbone group 0: {old_lr:.2e} → {new_lr:.2e}")
+            print(f"[LR] Head group 1:    {optimizer.param_groups[1]['lr']:.2e}")
 
         model.train()
         running_loss = 0.0
@@ -166,6 +183,14 @@ def main(config: EAHNConfig):
         epoch_real_total = 0
         epoch_fake_correct = 0
         epoch_fake_total = 0
+
+        # ── Cumulative window accumulators (100-batch) ───────────────────────
+        win_loss = 0.0
+        win_cls = 0.0
+        win_exp = 0.0
+        win_temp = 0.0
+        win_sim = 0.0
+        win_count = 0
 
         for batch_idx, batch in enumerate(train_loader):
             frames = batch["frames"].to(device)
@@ -199,7 +224,6 @@ def main(config: EAHNConfig):
                     l_grad_align = torch.nn.functional.mse_loss(out.M_t, grad_saliency)
 
                 _global_step = epoch * len(train_loader) + batch_idx
-                # FIX: Warmup increased from 200 → 2000 steps so L_exp ramps slowly
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 2000.0)
                 l_total = (
                     l_cls
@@ -248,11 +272,13 @@ def main(config: EAHNConfig):
                     epoch_fake_correct += (preds[fake_mask] == labels[fake_mask]).sum().item()
                     epoch_fake_total += fake_mask.sum().item()
 
+            # ── First-batch diagnostics (keep) ───────────────────────────────
             if epoch == 0 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
                 print(f"[DIAG] L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f} L_temp={l_temp.item():.4f}")
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})={torch.exp(model.cross_attention.log_temp).item():.3f}")
 
+            # ── LIVE sparse diagnostic every 20 batches (keep) ───────────────
             if batch_idx % 20 == 0:
                 _live_std = out.M_t.std().item()
                 _live_tau = model.cross_attention.log_temp.exp().item()
@@ -270,16 +296,44 @@ def main(config: EAHNConfig):
                     f"sample_sim={exp_out.inter_sample_sim:.2f}"
                 )
 
+            # ── Accumulate for 100-batch window ──────────────────────────────
+            win_loss += l_total.item()
+            win_cls += l_cls.item()
+            win_exp += l_exp.item()
+            win_temp += l_temp.item()
+            win_sim += exp_out.inter_sample_sim
+            win_count += 1
+
+            # ── Print cumulative summary every 100 batches ───────────────────
+            is_last = (batch_idx == total_batches - 1)
+            if (batch_idx + 1) % 100 == 0 or is_last:
+                n = max(win_count, 1)
+                print(
+                    f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
+                    f"Batch {batch_idx + 1:>{batch_w}}/{total_batches} | "
+                    f"AvgLoss: {win_loss/n:.4f} | "
+                    f"Cls: {win_cls/n:.4f} | "
+                    f"Exp: {win_exp/n:.4f} | "
+                    f"Temp: {win_temp/n:.4f} | "
+                    f"sim: {win_sim/n:.2f}"
+                )
+                # reset window
+                win_loss = win_cls = win_exp = win_temp = win_sim = 0.0
+                win_count = 0
+
             running_loss += l_total.item()
-            print(
-                f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
-                f"Batch {batch_idx + 1:>{batch_w}}/{total_batches} | "
-                f"Loss: {l_total.item():.4f} | "
-                f"Cls: {l_cls.item():.4f} | "
-                f"Exp: {l_exp.item():.4f} | "
-                f"Temp: {l_temp.item():.4f} | "
-                f"sim: {exp_out.inter_sample_sim:.2f}"
-            )
+
+        # FIX: Step any leftover gradients
+        if total_batches % config.grad_accum_steps != 0:
+            if use_amp:
+                scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
 
         scheduler.step()
 

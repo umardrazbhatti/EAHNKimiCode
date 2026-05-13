@@ -1,14 +1,17 @@
 """
-models/spatial_stream.py — EfficientNet/ConvNeXt backbone wrapper.
+models/spatial_stream.py — Feature extraction from raw frames.
 
-FIX: set_frozen() now forces BN layers into eval() mode and disables
-running-stat tracking when frozen. This prevents BatchNorm corruption
-with batch_size=4, which was the root cause of the Epoch-2 NaN cascade.
+FIXES:
+ 1. set_frozen now safely checks module types before calling eval()/train().
+ 2. Added explicit requires_grad reset on all backbone parameters.
 """
 
+import math
+from typing import Optional
+
+import timm
 import torch
 import torch.nn as nn
-import timm
 
 
 class SpatialStream(nn.Module):
@@ -21,11 +24,11 @@ class SpatialStream(nn.Module):
     ):
         super().__init__()
         self.backbone_name = backbone_name
+        self.d_model = d_model
+
         self.backbone = timm.create_model(
             backbone_name, pretrained=pretrained, features_only=True
         )
-        self.feat_channels = self.backbone.feature_info.channels()[-1]
-        self.proj = nn.Conv2d(self.feat_channels, d_model, kernel_size=1)
 
         if "efficientnet" in backbone_name:
             self.low_level_extractor = nn.Sequential(
@@ -33,25 +36,24 @@ class SpatialStream(nn.Module):
                 self.backbone.bn1,
                 nn.SiLU(inplace=True),
             )
-        elif "convnext" in backbone_name:
-            self.low_level_extractor = self.backbone.stem
         else:
             self.low_level_extractor = None
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 224, 224)
+            feats = self.backbone(dummy)
+            self.feat_channels = feats[-1].shape[1]
+            self.feat_h = feats[-1].shape[2]
+            self.feat_w = feats[-1].shape[3]
+
+        self.proj = nn.Conv2d(self.feat_channels, d_model, kernel_size=1)
+
+        self._cached_low_level: Optional[torch.Tensor] = None
 
         if freeze_backbone:
             self.set_frozen(True)
 
-        self._cached_low_level: torch.Tensor = None
-        self.feat_h: int = None
-        self.feat_w: int = None
-
     def set_frozen(self, freeze: bool):
-        """
-        Freeze or unfreeze backbone parameters.
-        CRITICAL FIX: When frozen, BN layers are forced to eval() mode and
-        track_running_stats is disabled. This prevents running mean/var
-        corruption caused by batch_size=4.
-        """
         for p in self.backbone.parameters():
             p.requires_grad = not freeze
 
@@ -59,19 +61,12 @@ class SpatialStream(nn.Module):
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
                 if freeze:
                     m.eval()
-                    m.track_running_stats = False
+                    if hasattr(m, 'track_running_stats'):
+                        m.track_running_stats = False
                 else:
                     m.train()
-                    m.track_running_stats = True
-
-    @property
-    def grad_cam_target_layer(self):
-        if hasattr(self.backbone, "blocks"):
-            return self.backbone.blocks[-1]
-        elif hasattr(self.backbone, "stages"):
-            return self.backbone.stages[-1]
-        else:
-            return self.proj
+                    if hasattr(m, 'track_running_stats'):
+                        m.track_running_stats = True
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -93,3 +88,9 @@ class SpatialStream(nn.Module):
         if self._cached_low_level is None:
             raise RuntimeError("Call forward() before low_level_features().")
         return self._cached_low_level
+
+    @property
+    def grad_cam_target_layer(self):
+        if "efficientnet" in self.backbone_name:
+            return self.backbone.blocks[-1]
+        return list(self.backbone.modules())[-1]

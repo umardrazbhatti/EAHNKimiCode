@@ -140,4 +140,7 @@ def parse_args() -> argparse.Namespace:
                         choices=["bce", "focal"])
     parser.add_argument("--focal_alpha", type=float, default=None)
     parser.add_argument("--focal_gamma", type=float, default=None)
+    # NEW: missing CLI args
+    parser.add_argument("--grad_accum_steps", type=int, default=None)
+    parser.add_argument("--class_sep_weight", type=float, default=None)
     return parser.parse_args()
