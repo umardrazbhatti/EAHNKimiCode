@@ -1,5 +1,7 @@
 """
 models/cross_attention.py — Cross-Attention Fusion with learnable temperature.
+
+FIX: temp_init now properly used; clamping handled in EAHN.forward().
 """
 
 import math
@@ -16,7 +18,6 @@ class CrossAttentionFusion(nn.Module):
         self.head_dim = d_model // num_heads
         self.scale = math.sqrt(self.head_dim)
 
-        # FIX: Use passed temp_init instead of hardcoded log(4.0)
         self.log_temp = nn.Parameter(torch.tensor(float(temp_init)))
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
@@ -35,6 +36,7 @@ class CrossAttentionFusion(nn.Module):
         Kp = self.k_proj(S_flat)
         Vp = self.v_proj(S_flat)
 
+        # Temperature clamped externally in EAHN.forward() to [1.0, 2.0]
         tau = torch.exp(self.log_temp).clamp(min=0.5, max=10.0)
         scores = torch.bmm(Qp, Kp.transpose(-2, -1)) / (self.scale * tau)
         A = F.softmax(scores, dim=-1)

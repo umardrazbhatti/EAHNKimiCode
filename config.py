@@ -1,11 +1,6 @@
 """
 config.py — single source of truth for all EAHN hyperparameters.
 CLI overrides via argparse; no hardcoded paths anywhere else.
-
-FIX: attn_temp_init changed from 1.386 (τ=4.0) to 0.0 (τ=1.0).
-A temperature of 4.0 forces uniform attention maps (M_t ≈ 1/49 everywhere),
-which creates a flat loss landscape with zero gradients for the temperature
-parameter — the "uniform attention trap" that locked τ at 4.0 forever.
 """
 
 import argparse
@@ -41,16 +36,16 @@ class EAHNConfig:
 
     # ── Loss weights ──────────────────────────────────────────────────────────
     lambda1: float = 1.0          # L_exp weight
-    lambda2: float = 0.02         # FIX: was 0.05 — weaker temporal smoothing
+    lambda2: float = 0.02         # L_temp weight
     alpha: float = 0.5            # entropy weight
     beta: float = 0.5             # TV weight in weak supervision
     gamma: float = 0.1            # gate decay rate in L_temp
-    attn_temp_init: float = 0.0   # FIX: was 1.386 (τ=4.0). Now 0.0 → τ=1.0
-    attn_diversity_weight: float = 8.0   # FIX: was 2.5 — much stronger diversity
+    attn_temp_init: float = 0.0   # log(τ_init); τ=1.0 at start
+    attn_diversity_weight: float = 8.0
     cls_dropout_p: float = 0.0    # DISABLED
     lambda_grad_align: float = 0.1
-    label_smoothing: float = 0.02 # FIX: was 0.05 — sharper decisions
-    class_sep_weight: float = 0.5 # NEW: class-separation loss weight
+    label_smoothing: float = 0.02
+    class_sep_weight: float = 0.5
 
     # ── Backbone freezing ─────────────────────────────────────────────────────
     freeze_backbone: bool = True
@@ -62,9 +57,9 @@ class EAHNConfig:
     focal_gamma: float = 2.0
 
     # ── Training ──────────────────────────────────────────────────────────────
-    epochs: int = 5               # FIX: was 50 — run 5 for this test
+    epochs: int = 5
     batch_size: int = 4
-    grad_accum_steps: int = 4     # FIX: was 2 — effective batch size = 16
+    grad_accum_steps: int = 4     # effective batch = 16
     lr: float = 1e-4
     weight_decay: float = 1e-2
     mixed_precision: bool = True
@@ -140,7 +135,6 @@ def parse_args() -> argparse.Namespace:
                         choices=["bce", "focal"])
     parser.add_argument("--focal_alpha", type=float, default=None)
     parser.add_argument("--focal_gamma", type=float, default=None)
-    # NEW: missing CLI args
     parser.add_argument("--grad_accum_steps", type=int, default=None)
     parser.add_argument("--class_sep_weight", type=float, default=None)
     return parser.parse_args()

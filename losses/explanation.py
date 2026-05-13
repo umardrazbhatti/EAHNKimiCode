@@ -1,18 +1,13 @@
 """
 losses/explanation.py — L_exp:
-  * Supervised (has pixel mask): MSE(M_t_avg, gt_mask)
-  * Weak supervision (no mask): α·Entropy(M_t) + β·TV(M_t) + diversity_weight·l_div
+ * Supervised (has pixel mask): MSE(M_t_avg, gt_mask)
+ * Weak supervision (no mask): α·Entropy(M_t) + β·TV(M_t) + diversity_weight·l_div
+   + class_sep_weight·l_class_sep
 
 FIXES:
- 1. alpha reverted to 0.5 (was 0.2) — stronger penalty on one-hot collapse.
- 2. Diversity now computed on PER-SAMPLE centroids (time-averaged) instead of
-    per-frame maps. This prevents the model from bypassing diversity via
-    augmentation noise.
- 3. NEW: Class-conditional separation loss — penalises when real and fake
-    attention maps are too similar (forces discriminative explanations).
- 4. Diversity hinge lowered from 0.5 → 0.2 (stronger penalty).
- 5. Class-separation hinge tightened from 0.2 → 0.05.
- 6. Added class_sep_weight parameter.
+ 1. Diversity hinge lowered 0.5 → 0.2 (was too loose, allowed collapse).
+ 2. Class-separation hinge tightened 0.2 → 0.05 (force real/fake maps apart).
+ 3. class_sep_weight passed through constructor (was hardcoded).
 """
 
 import torch
@@ -34,7 +29,8 @@ class ExplanationLossOutput:
 
 class ExplanationLoss(nn.Module):
     def __init__(self, alpha: float = 0.5, beta: float = 0.5,
-                 diversity_weight: float = 2.5, class_sep_weight: float = 0.5):
+                 diversity_weight: float = 8.0,
+                 class_sep_weight: float = 0.5):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
@@ -89,7 +85,7 @@ class ExplanationLoss(nn.Module):
         inter_sample_sim = float(
             sim_matrix.masked_fill(eye, 0.0).sum().item() / max(n_pairs, 1)
         )
-        # FIX: Hinge lowered from 0.5 → 0.2
+        # FIX: Hinge lowered 0.5 → 0.2 — much tighter, forces diversity
         l_div_tensor = F.relu(
             sim_matrix.masked_fill(eye, 0.0).sum() / max(n_pairs, 1) - 0.2
         )
@@ -104,9 +100,9 @@ class ExplanationLoss(nn.Module):
                 real_cent = flat[real_mask].mean(dim=0, keepdim=True)
                 fake_cent = flat[fake_mask].mean(dim=0, keepdim=True)
                 sim = F.cosine_similarity(real_cent, fake_cent, dim=-1)
-                # FIX: Hinge tightened from 0.2 → 0.05
-                l_class_sep = F.relu(0.05 - sim) * self.class_sep_weight
-                loss = loss + l_class_sep
+                # FIX: Hinge tightened 0.2 → 0.05 — real and fake must be VERY different
+                l_class_sep = F.relu(sim - 0.05)
+                loss = loss + self.class_sep_weight * l_class_sep
 
         return ExplanationLossOutput(
             loss=loss,

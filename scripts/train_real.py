@@ -2,23 +2,13 @@
 scripts/train_real.py — Phase 2 GPU training on FF++/Celeb-DF/DFDC.
 
 FIXES vs previous version:
- 1. Backbone freezing now freezes BN stats (prevents NaN cascade).
- 2. Removed cls_dropout dependency.
- 3. Gradient-alignment loss fixed (no .backward() contamination).
- 4. Temperature clamped to [1.0, 2.0] (escapes uniform trap).
- 5. Focal loss now uses label smoothing.
- 6. NaN/Inf guards on model outputs and loss — skip bad batches.
- 7. lambda1_eff warmup increased 200 → 2000 steps so explanation loss
-    does not overwhelm the classifier while attention is still learning.
- 8. Per-class accuracy logging preserved.
- 9. Differential learning rates: backbone gets 0.1× head LR.
-10. Unfreeze LR logic fixed for multi-group optimizer.
-11. FIX: scheduler.base_lrs updated on unfreeze so CosineAnnealingLR
-    respects the reduced backbone LR.
-12. FIX: torch.cuda.empty_cache() before unfreeze to prevent OOM.
-13. FIX: step leftover gradients at end of epoch to prevent stale grads.
-14. FIX: wrap unfreeze in try/except with clear diagnostics.
-15. FIX: cumulative 100-batch logging to prevent Kaggle log bloat.
+ 1. compute_gradient_saliency wrapped in try/except OOM with fallback.
+ 2. Logging changed: cumulative window prints every 300 batches (was 100).
+    LIVE diagnostics kept every 20 batches for debugging.
+ 3. First-batch diagnostics kept.
+ 4. Backbone freezing + unfreeze logic preserved with empty_cache.
+ 5. Differential LR + scheduler base_lrs fix preserved.
+ 6. Stale gradient step at epoch end preserved.
 """
 
 import os
@@ -97,7 +87,7 @@ def main(config: EAHNConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EAHN(config).to(device)
 
-    # FIX: Differential learning rates — backbone gets 0.1× head LR
+    # Differential learning rates — backbone gets 0.1× head LR
     backbone_params = []
     head_params = []
     for name, param in model.named_parameters():
@@ -143,7 +133,7 @@ def main(config: EAHNConfig):
         alpha=config.alpha,
         beta=config.beta,
         diversity_weight=config.attn_diversity_weight,
-        class_sep_weight=0.5,
+        class_sep_weight=config.class_sep_weight,
     )
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
@@ -173,7 +163,7 @@ def main(config: EAHNConfig):
             optimizer.param_groups[0]["lr"] = new_lr
             scheduler.base_lrs[0] = new_lr
             print(f"[LR] Backbone group 0: {old_lr:.2e} → {new_lr:.2e}")
-            print(f"[LR] Head group 1:    {optimizer.param_groups[1]['lr']:.2e}")
+            print(f"[LR] Head group 1: {optimizer.param_groups[1]['lr']:.2e}")
 
         model.train()
         running_loss = 0.0
@@ -184,7 +174,7 @@ def main(config: EAHNConfig):
         epoch_fake_correct = 0
         epoch_fake_total = 0
 
-        # ── Cumulative window accumulators (100-batch) ───────────────────────
+        # ── Cumulative window accumulators (300-batch) ───────────────────────
         win_loss = 0.0
         win_cls = 0.0
         win_exp = 0.0
@@ -203,13 +193,14 @@ def main(config: EAHNConfig):
             with ctx:
                 out = model(frames)
 
-                # ── NaN/Inf guard on model outputs ──────────────────────────
+                # NaN/Inf guard on model outputs
                 if (torch.isnan(out.logit).any() or torch.isinf(out.logit).any() or
                     torch.isnan(out.M_t).any() or torch.isinf(out.M_t).any()):
-                    print(
-                        f"[WARNING] NaN/Inf in model outputs at "
-                        f"E{epoch+1}B{batch_idx}. Skipping batch."
-                    )
+                    if batch_idx % 20 == 0:
+                        print(
+                            f"[WARN] NaN/Inf in model outputs at "
+                            f"E{epoch+1}B{batch_idx}. Skipping batch."
+                        )
                     optimizer.zero_grad()
                     continue
 
@@ -218,10 +209,20 @@ def main(config: EAHNConfig):
                 l_exp = exp_out.loss
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
 
+                # ── Gradient alignment with OOM safety ─────────────────────
                 l_grad_align = torch.tensor(0.0, device=device)
+                grad_saliency = None
                 if config.lambda_grad_align > 0 and batch_idx % 5 == 0:
-                    grad_saliency = model.compute_gradient_saliency(frames)
-                    l_grad_align = torch.nn.functional.mse_loss(out.M_t, grad_saliency)
+                    try:
+                        grad_saliency = model.compute_gradient_saliency(frames)
+                        l_grad_align = torch.nn.functional.mse_loss(out.M_t, grad_saliency)
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        if batch_idx % 20 == 0:
+                            print(
+                                f"[WARN] OOM in saliency at E{epoch+1}B{batch_idx}; "
+                                f"skipping L_grad_align for this batch"
+                            )
 
                 _global_step = epoch * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 2000.0)
@@ -232,18 +233,20 @@ def main(config: EAHNConfig):
                     + config.lambda_grad_align * l_grad_align
                 )
 
-                # ── NaN/Inf guard on loss ───────────────────────────────────
+                # NaN/Inf guard on loss
                 if torch.isnan(l_total) or torch.isinf(l_total):
-                    print(
-                        f"[WARNING] NaN/Inf loss at E{epoch+1}B{batch_idx}. "
-                        f"L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f}. "
-                        "Skipping batch."
-                    )
+                    if batch_idx % 20 == 0:
+                        print(
+                            f"[WARN] NaN/Inf loss at E{epoch+1}B{batch_idx}. "
+                            f"L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f}. "
+                            "Skipping batch."
+                        )
                     optimizer.zero_grad()
                     continue
 
                 loss = l_total / config.grad_accum_steps
 
+            # Backward (outside autocast)
             if use_amp:
                 scaler.scale(loss).backward()
             else:
@@ -278,7 +281,7 @@ def main(config: EAHNConfig):
                 print(f"[DIAG] L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f} L_temp={l_temp.item():.4f}")
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})={torch.exp(model.cross_attention.log_temp).item():.3f}")
 
-            # ── LIVE sparse diagnostic every 20 batches (keep) ───────────────
+            # ── LIVE sparse diagnostic every 20 batches ────────────────────
             if batch_idx % 20 == 0:
                 _live_std = out.M_t.std().item()
                 _live_tau = model.cross_attention.log_temp.exp().item()
@@ -296,7 +299,7 @@ def main(config: EAHNConfig):
                     f"sample_sim={exp_out.inter_sample_sim:.2f}"
                 )
 
-            # ── Accumulate for 100-batch window ──────────────────────────────
+            # ── Accumulate for 300-batch window ──────────────────────────────
             win_loss += l_total.item()
             win_cls += l_cls.item()
             win_exp += l_exp.item()
@@ -304,9 +307,9 @@ def main(config: EAHNConfig):
             win_sim += exp_out.inter_sample_sim
             win_count += 1
 
-            # ── Print cumulative summary every 100 batches ───────────────────
+            # ── Print cumulative summary every 300 batches ─────────────────
             is_last = (batch_idx == total_batches - 1)
-            if (batch_idx + 1) % 100 == 0 or is_last:
+            if (batch_idx + 1) % 300 == 0 or is_last:
                 n = max(win_count, 1)
                 print(
                     f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
@@ -323,7 +326,7 @@ def main(config: EAHNConfig):
 
             running_loss += l_total.item()
 
-        # FIX: Step any leftover gradients
+        # FIX: Step any leftover gradients at epoch end
         if total_batches % config.grad_accum_steps != 0:
             if use_amp:
                 scaler.unscale_(optimizer)
