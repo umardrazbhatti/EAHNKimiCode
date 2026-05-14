@@ -21,7 +21,10 @@ class FocalLoss(nn.Module):
     Focal loss for class-imbalanced binary classification.
     Safe under torch.autocast because it uses BCEWithLogits.
 
-    FIX: Now accepts label_smoothing (was silently ignored before).
+    FIX: alpha is now class-conditional (P2).
+         alpha_t = alpha      if y == 1 (fake)
+         alpha_t = 1 - alpha  if y == 0 (real)
+         With alpha=0.25, real (minority) gets 0.75 weight, fake gets 0.25.
     """
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0, label_smoothing: float = 0.0):
         super().__init__()
@@ -39,7 +42,13 @@ class FocalLoss(nn.Module):
         with torch.no_grad():
             prob = torch.sigmoid(logit)
             pt = torch.where(target > 0.5, prob, 1 - prob)
-            focal_weight = self.alpha * (1 - pt).pow(self.gamma)
+            # P2 FIX: class-conditional alpha
+            alpha_t = torch.where(
+                target > 0.5,
+                torch.tensor(self.alpha, device=logit.device, dtype=logit.dtype),
+                torch.tensor(1.0 - self.alpha, device=logit.device, dtype=logit.dtype),
+            )
+            focal_weight = alpha_t * (1 - pt).pow(self.gamma)
 
         return (focal_weight * bce).mean()
 

@@ -43,27 +43,30 @@ class EAHNConfig:
     attn_temp_init: float = 0.0   # log(τ_init); τ=1.0 at start
     attn_diversity_weight: float = 8.0
     cls_dropout_p: float = 0.0    # DISABLED
-    lambda_grad_align: float = 0.1
+    lambda_grad_align: float = 0.0 # REMOVED from training (P3)
     label_smoothing: float = 0.02
     class_sep_weight: float = 0.5
 
     # ── Backbone freezing ─────────────────────────────────────────────────────
     freeze_backbone: bool = True
-    unfreeze_backbone_epoch: int = 3
+    unfreeze_backbone_epoch: int = 1   # CHANGED: unfreeze after epoch 1 (was 3)
 
     # ── Classification loss ───────────────────────────────────────────────────
     cls_loss_type: str = "focal"
-    focal_alpha: float = 0.25
+    focal_alpha: float = 0.25     # class-conditional: fake=0.25, real=0.75
     focal_gamma: float = 2.0
 
     # ── Training ──────────────────────────────────────────────────────────────
-    epochs: int = 5
+    epochs: int = 15              # CHANGED: 15 instead of 5
     batch_size: int = 4
     grad_accum_steps: int = 4     # effective batch = 16
     lr: float = 1e-4
+    backbone_lr_ratio: float = 0.2  # NEW: backbone LR = lr * ratio
     weight_decay: float = 1e-2
     mixed_precision: bool = True
     num_workers: int = 0
+    warmup_epochs: int = 2        # NEW: linear warmup
+    patience: int = 3             # NEW: early stopping patience
 
     # ── Evaluation / Visualisation ────────────────────────────────────────────
     eval_after_train: bool = True
@@ -113,6 +116,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--backbone_lr_ratio", type=float, default=None)
+    parser.add_argument("--warmup_epochs", type=int, default=None)
+    parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--lambda1", type=float, default=None)
     parser.add_argument("--lambda2", type=float, default=None)
     parser.add_argument("--heatmap_samples", type=int, default=None)

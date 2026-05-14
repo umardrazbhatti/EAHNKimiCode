@@ -1,18 +1,19 @@
 """
 scripts/train_real.py — Phase 2 GPU training on FF++/Celeb-DF/DFDC.
 
-FIXES vs previous version:
- 1. compute_gradient_saliency wrapped in try/except OOM with fallback.
- 2. Logging changed: cumulative window prints every 300 batches (was 100).
-    LIVE diagnostics kept every 20 batches for debugging.
- 3. First-batch diagnostics kept.
- 4. Backbone freezing + unfreeze logic preserved with empty_cache.
- 5. Differential LR + scheduler base_lrs fix preserved.
- 6. Stale gradient step at epoch end preserved.
+FIXES APPLIED:
+ 1. P0: Architecture now concatenates cls_out + attn_pool; no code change needed
+        in training loop, but classifier automatically learns attention-aware weights.
+ 2. P1: Backbone unfreezes at epoch 1 (was 3) with NO lr reduction.
+         Warmup + cosine scheduler. Backbone LR = 0.2 * head LR.
+ 3. P2: Focal loss is now class-conditional (fixed in losses/classification.py).
+ 4. P3: L_grad_align and compute_gradient_saliency REMOVED from training.
+ 5. P4: 15 epochs with early stopping (patience=3). Per-class val metrics.
 """
 
 import os
 import math
+import csv
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -40,9 +41,10 @@ def main(config: EAHNConfig):
         if cap[0] < 7:
             print(
                 f"[WARNING] sm_{cap[0]}{cap[1]} is below PyTorch minimum "
-                f"(sm_70). Switch Kaggle accelerator to T4. "
+                "(sm_70). Switch Kaggle accelerator to T4. "
                 "Falling back to CPU for MTCNN. AMP disabled."
             )
+            config.mixed_precision = False
     os.makedirs(config.output_dir, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -87,7 +89,7 @@ def main(config: EAHNConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EAHN(config).to(device)
 
-    # Differential learning rates — backbone gets 0.1× head LR
+    # Differential learning rates — backbone gets backbone_lr_ratio × head LR
     backbone_params = []
     head_params = []
     for name, param in model.named_parameters():
@@ -96,14 +98,21 @@ def main(config: EAHNConfig):
         else:
             head_params.append(param)
 
+    backbone_lr = config.lr * config.backbone_lr_ratio
     optimizer = torch.optim.AdamW([
-        {"params": backbone_params, "lr": config.lr * 0.1},
-        {"params": head_params, "lr": config.lr},
-    ], weight_decay=config.weight_decay)
+        {"params": backbone_params, "lr": backbone_lr, "weight_decay": config.weight_decay},
+        {"params": head_params, "lr": config.lr, "weight_decay": config.weight_decay},
+    ])
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs, eta_min=1e-6
-    )
+    # Warmup + Cosine Annealing scheduler
+    def lr_lambda(epoch):
+        if epoch < config.warmup_epochs:
+            return (epoch + 1) / (config.warmup_epochs + 1)
+        else:
+            progress = (epoch - config.warmup_epochs) / max(config.epochs - config.warmup_epochs, 1)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     use_amp = (
         config.mixed_precision
@@ -121,6 +130,7 @@ def main(config: EAHNConfig):
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
     best_auc = -1.0
+    patience_counter = 0
     if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
         ckpt = load_checkpoint(config.resume_checkpoint, model, optimizer, scheduler)
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -139,6 +149,16 @@ def main(config: EAHNConfig):
 
     ckpt_path = os.path.join(config.output_dir, "best_model.pth")
 
+    # ── Metrics CSV ───────────────────────────────────────────────────────────
+    metrics_csv_path = os.path.join(config.output_dir, "train_metrics.csv")
+    with open(metrics_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "epoch", "train_loss", "train_real_acc", "train_fake_acc",
+            "val_auc", "val_f1", "val_real_acc", "val_fake_acc",
+            "lr_backbone", "lr_head"
+        ])
+
     # ── Training loop ─────────────────────────────────────────────────────────
     import contextlib
     total_batches = len(train_loader)
@@ -148,22 +168,11 @@ def main(config: EAHNConfig):
     for epoch in range(start_epoch, config.epochs):
         # ── Unfreeze backbone at scheduled epoch ─────────────────────────────
         if config.freeze_backbone and epoch == config.unfreeze_backbone_epoch:
-            print(f"[Backbone] Preparing to unfreeze at epoch {epoch} ...")
+            print(f"[Backbone] Unfreezing at epoch {epoch} ...")
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-                print(f"[VRAM] Cached before empty: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-            try:
-                model.spatial_stream.set_frozen(False)
-                print(f"[Backbone] Unfrozen at epoch {epoch}")
-            except Exception as e:
-                raise RuntimeError(f"set_frozen(False) failed: {e}")
-
-            old_lr = optimizer.param_groups[0]["lr"]
-            new_lr = old_lr * 0.1
-            optimizer.param_groups[0]["lr"] = new_lr
-            scheduler.base_lrs[0] = new_lr
-            print(f"[LR] Backbone group 0: {old_lr:.2e} → {new_lr:.2e}")
-            print(f"[LR] Head group 1: {optimizer.param_groups[1]['lr']:.2e}")
+            model.spatial_stream.set_frozen(False)
+            print(f"[Backbone] Unfrozen at epoch {epoch}")
 
         model.train()
         running_loss = 0.0
@@ -209,28 +218,13 @@ def main(config: EAHNConfig):
                 l_exp = exp_out.loss
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
 
-                # ── Gradient alignment with OOM safety ─────────────────────
-                l_grad_align = torch.tensor(0.0, device=device)
-                grad_saliency = None
-                if config.lambda_grad_align > 0 and batch_idx % 5 == 0:
-                    try:
-                        grad_saliency = model.compute_gradient_saliency(frames)
-                        l_grad_align = torch.nn.functional.mse_loss(out.M_t, grad_saliency)
-                    except torch.cuda.OutOfMemoryError:
-                        torch.cuda.empty_cache()
-                        if batch_idx % 20 == 0:
-                            print(
-                                f"[WARN] OOM in saliency at E{epoch+1}B{batch_idx}; "
-                                f"skipping L_grad_align for this batch"
-                            )
-
+                # P3: L_grad_align completely removed
                 _global_step = epoch * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 2000.0)
                 l_total = (
                     l_cls
                     + _lambda1_eff * l_exp
                     + config.lambda2 * l_temp
-                    + config.lambda_grad_align * l_grad_align
                 )
 
                 # NaN/Inf guard on loss
@@ -275,7 +269,7 @@ def main(config: EAHNConfig):
                     epoch_fake_correct += (preds[fake_mask] == labels[fake_mask]).sum().item()
                     epoch_fake_total += fake_mask.sum().item()
 
-            # ── First-batch diagnostics (keep) ───────────────────────────────
+            # ── First-batch diagnostics ───────────────────────────────
             if epoch == 0 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
                 print(f"[DIAG] L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f} L_temp={l_temp.item():.4f}")
@@ -295,7 +289,6 @@ def main(config: EAHNConfig):
                     f"L_div={exp_out.l_div:.2f} "
                     f"L_class_sep={exp_out.l_class_sep:.2f} "
                     f"L_temp={l_temp.item():.4f} "
-                    f"L_grad={l_grad_align.item():.4f} "
                     f"sample_sim={exp_out.inter_sample_sim:.2f}"
                 )
 
@@ -320,7 +313,6 @@ def main(config: EAHNConfig):
                     f"Temp: {win_temp/n:.4f} | "
                     f"sim: {win_sim/n:.2f}"
                 )
-                # reset window
                 win_loss = win_cls = win_exp = win_temp = win_sim = 0.0
                 win_count = 0
 
@@ -343,7 +335,7 @@ def main(config: EAHNConfig):
         real_acc = epoch_real_correct / max(epoch_real_total, 1)
         fake_acc = epoch_fake_correct / max(epoch_fake_total, 1)
         print(
-            f"[Epoch {epoch+1} Class Acc] Real: {real_acc:.3f} ({epoch_real_correct}/{epoch_real_total}) "
+            f"[Epoch {epoch+1} Train Acc] Real: {real_acc:.3f} ({epoch_real_correct}/{epoch_real_total}) "
             f"Fake: {fake_acc:.3f} ({epoch_fake_correct}/{epoch_fake_total})"
         )
 
@@ -366,19 +358,65 @@ def main(config: EAHNConfig):
                 labels_list.extend(batch["label"].cpu().tolist())
 
         metrics = DetectionMetrics.compute(probs_list, labels_list)
-        logger.log_scalars("val", metrics, epoch)
-        print(
-            f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
-            f"Val AUC-ROC: {metrics['auc_roc']:.4f} | "
-            f"F1: {metrics['f1']:.4f}"
-        )
+
+        # Per-class validation metrics
+        probs_arr = np.array(probs_list)
+        labels_arr = np.array(labels_list, dtype=int)
+        preds_arr = (probs_arr >= 0.5).astype(int)
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(labels_arr, preds_arr)
+        if cm.shape == (2, 2):
+            tn, fp, fn, tp = cm.ravel()
+            val_real_acc = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            val_fake_acc = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        else:
+            val_real_acc = val_fake_acc = 0.0
 
         val_auc = metrics.get("auc_roc", float("nan"))
+        val_f1 = metrics.get("f1", 0.0)
+
+        print(
+            f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
+            f"Val AUC-ROC: {val_auc:.4f} | F1: {val_f1:.4f} | "
+            f"Real Acc: {val_real_acc:.3f} | Fake Acc: {val_fake_acc:.3f}"
+        )
+
+        logger.log_scalars("val", {
+            "auc_roc": val_auc,
+            "f1": val_f1,
+            "real_acc": val_real_acc,
+            "fake_acc": val_fake_acc,
+        }, epoch)
+
+        # Save metrics CSV
+        with open(metrics_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch + 1,
+                f"{avg_train_loss:.4f}",
+                f"{real_acc:.4f}",
+                f"{fake_acc:.4f}",
+                f"{val_auc:.4f}",
+                f"{val_f1:.4f}",
+                f"{val_real_acc:.4f}",
+                f"{val_fake_acc:.4f}",
+                f"{optimizer.param_groups[0]['lr']:.2e}",
+                f"{optimizer.param_groups[1]['lr']:.2e}",
+            ])
+
+        # ── Best model & early stopping ─────────────────────────────────────
         if not math.isnan(val_auc) and val_auc > best_auc:
             best_auc = val_auc
+            patience_counter = 0
             save_checkpoint(model, optimizer, scheduler, epoch, best_auc,
                             config, ckpt_path)
             print(f"--> Best model saved (AUC-ROC: {best_auc:.4f})")
+        else:
+            patience_counter += 1
+            print(f"--> No improvement. Patience: {patience_counter}/{config.patience}")
+            if patience_counter >= config.patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
 
         last_ckpt = os.path.join(config.output_dir, f"checkpoint_epoch{epoch:03d}.pth")
         save_checkpoint(model, optimizer, scheduler, epoch, val_auc, config, last_ckpt)
