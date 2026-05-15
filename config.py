@@ -1,24 +1,23 @@
 """
-config.py — single source of truth for all EAHN hyperparameters.
-CLI overrides via argparse; no hardcoded paths anywhere else.
+config.py — Two-phase defaults: synthetic pre-training + FF++ fine-tuning.
 """
 
 import argparse
 import warnings
 import torch
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 
 @dataclass
 class EAHNConfig:
-    # ── Paths ─────────────────────────────────────────────────────────────────
+    # ── Paths ─────────────────────────────────────────────────────────────
     data_root: str = "/kaggle/input/"
     output_dir: str = "/kaggle/working/outputs/"
     cache_dir: str = "/kaggle/working/.face_cache/"
-    resume_checkpoint: str = ""
+    resume_checkpoint: str = ""          # For FF++ phase: path to synthetic_pretrained.pth
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
+    # ── Dataset ───────────────────────────────────────────────────────────
     dataset_name: Literal["synthetic", "ff++", "celeb_df", "dfdc"] = "ff++"
     dataset_compression: str = "c23"
     num_frames: int = 16
@@ -26,7 +25,7 @@ class EAHNConfig:
     train_split: float = 0.8
     val_split: float = 0.1
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────
     backbone: str = "efficientnet_b4"
     backbone_pretrained: bool = True
     transformer_layers: int = 4
@@ -34,55 +33,55 @@ class EAHNConfig:
     d_model: int = 256
     dropout: float = 0.1
 
-    # ── Loss weights ──────────────────────────────────────────────────────────
-    lambda1: float = 1.0          # L_exp weight
-    lambda2: float = 0.02         # L_temp weight
-    alpha: float = 0.5            # entropy weight
-    beta: float = 0.5             # TV weight in weak supervision
-    gamma: float = 0.1            # gate decay rate in L_temp
-    attn_temp_init: float = 0.0   # log(τ_init); τ=1.0 at start
+    # ── Loss weights ──────────────────────────────────────────────────────
+    # PHASE 1 (Synthetic): lambda1=1.0  (strong mask supervision)
+    # PHASE 2 (FF++):     lambda1=0.05 (weakly-supervised nudge)
+    lambda1: float = 0.05
+    lambda2: float = 0.02
+    alpha: float = 0.5
+    beta: float = 0.5
+    gamma: float = 0.1
+    attn_temp_init: float = 0.0
     attn_diversity_weight: float = 8.0
-    cls_dropout_p: float = 0.0    # DISABLED
-    lambda_grad_align: float = 0.0 # REMOVED from training (P3)
+    cls_dropout_p: float = 0.0
+    lambda_grad_align: float = 0.0       # REMOVED
     label_smoothing: float = 0.02
     class_sep_weight: float = 0.5
 
-    # ── Backbone freezing ─────────────────────────────────────────────────────
-    freeze_backbone: bool = True
-    unfreeze_backbone_epoch: int = 1   # CHANGED: unfreeze after epoch 1 (was 3)
+    # ── Backbone ──────────────────────────────────────────────────────────
+    freeze_backbone: bool = False        # CHANGED: unfreeze immediately
+    unfreeze_backbone_epoch: int = 0
+    backbone_lr_ratio: float = 1.0       # CHANGED: backbone gets same LR as head
 
-    # ── Classification loss ───────────────────────────────────────────────────
+    # ── Classification loss ───────────────────────────────────────────────
     cls_loss_type: str = "focal"
-    focal_alpha: float = 0.25     # class-conditional: fake=0.25, real=0.75
+    focal_alpha: float = 0.25
     focal_gamma: float = 2.0
 
-    # ── Training ──────────────────────────────────────────────────────────────
-    epochs: int = 15              # CHANGED: 15 instead of 5
+    # ── Training ──────────────────────────────────────────────────────────
+    epochs: int = 15
     batch_size: int = 4
-    grad_accum_steps: int = 4     # effective batch = 16
-    lr: float = 1e-4
-    backbone_lr_ratio: float = 0.2  # NEW: backbone LR = lr * ratio
+    grad_accum_steps: int = 4
+    lr: float = 5e-4                     # CHANGED: 5e-4 (backbone must learn)
     weight_decay: float = 1e-2
     mixed_precision: bool = True
     num_workers: int = 0
-    warmup_epochs: int = 2        # NEW: linear warmup
-    patience: int = 3             # NEW: early stopping patience
+    warmup_epochs: int = 2
+    patience: int = 3
 
-    # ── Evaluation / Visualisation ────────────────────────────────────────────
+    # ── Evaluation ────────────────────────────────────────────────────────
     eval_after_train: bool = True
     save_heatmaps: bool = True
     heatmap_samples: int = 20
 
-    # ── Device ────────────────────────────────────────────────────────────────
+    # ── Device ────────────────────────────────────────────────────────────
     device: str = "auto"
 
     def __post_init__(self):
         if self.device == "auto":
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            else:
-                self.device = "cpu"
-                warnings.warn("No GPU found. Switching to CPU with reduced settings.")
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            if self.device == "cpu":
+                warnings.warn("No GPU. Using CPU-safe overrides.")
                 self._apply_cpu_safe_overrides()
 
     def _apply_cpu_safe_overrides(self):
@@ -105,12 +104,11 @@ class EAHNConfig:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="EAHN Training and Evaluation")
+    parser = argparse.ArgumentParser(description="EAHN Training")
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
-    parser.add_argument("--dataset_name", type=str, default=None,
-                        choices=["synthetic", "ff++", "celeb_df", "dfdc"])
+    parser.add_argument("--dataset_name", type=str, default=None, choices=["synthetic", "ff++", "celeb_df", "dfdc"])
     parser.add_argument("--dataset_compression", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -137,8 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label_smoothing", type=float, default=None)
     parser.add_argument("--freeze_backbone", action="store_true", default=None)
     parser.add_argument("--unfreeze_backbone_epoch", type=int, default=None)
-    parser.add_argument("--cls_loss_type", type=str, default=None,
-                        choices=["bce", "focal"])
+    parser.add_argument("--cls_loss_type", type=str, default=None, choices=["bce", "focal"])
     parser.add_argument("--focal_alpha", type=float, default=None)
     parser.add_argument("--focal_gamma", type=float, default=None)
     parser.add_argument("--grad_accum_steps", type=int, default=None)

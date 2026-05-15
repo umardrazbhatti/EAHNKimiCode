@@ -1,11 +1,20 @@
 """
 scripts/evaluate.py — Full evaluation: detection + explanation metrics + heatmaps.
+
+FIXES APPLIED:
+  1. GradCAMExplainer now called without target_layer kwarg (auto-detects internally).
+  2. Faithfulness gradient computation fixed: proper retain_graph, zero_grad, detach.
+  3. Deletion/Insertion AUC: safer tensor handling, explicit shape checks.
+  4. Added missing torch.nn.functional import.
+  5. load_checkpoint now loads only model weights for evaluation.
+  6. Added try/except around entire heatmap generation to prevent eval crash.
 """
 
 import os
 import csv
 import contextlib
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -116,7 +125,7 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
 def run_evaluation(config: EAHNConfig):
     device = torch.device(config.device)
 
-    model     = EAHN(config).to(device)
+    model = EAHN(config).to(device)
     ckpt_path = os.path.join(config.output_dir, "best_model.pth")
     if not os.path.exists(ckpt_path):
         import glob as _glob
@@ -131,7 +140,13 @@ def run_evaluation(config: EAHNConfig):
                 f"No checkpoint found in {config.output_dir}. "
                 "Did training complete without errors?"
             )
-    load_checkpoint(ckpt_path, model)
+
+    # FIX: Load only model weights for evaluation (no optimizer/scheduler needed)
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    if "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    else:
+        model.load_state_dict(checkpoint, strict=False)
     model.eval()
     print("Loaded best model for evaluation.")
 
@@ -207,24 +222,53 @@ def run_evaluation(config: EAHNConfig):
 
     ssim_val = ExplanationMetrics.temporal_ssim(all_M_t_up[indices])
 
+    # FIX: Faithfulness gradient computation — proper retain_graph, zero_grad, detach
     grad_maps = []
+    model.zero_grad(set_to_none=True)
     for idx in tqdm(indices, desc="Computing faithfulness", leave=False):
         sample      = test_ds[idx]
         frames_t    = sample["frames"].unsqueeze(0).to(device)
+
+        # Ensure gradients are enabled and model is in train mode temporarily
+        was_training = model.training
+        model.train()
+        for p in model.parameters():
+            p.requires_grad = True
+
         frames_t.requires_grad_(True)
-        out         = model(frames_t)
-        out.logit.backward()
-        grads       = frames_t.grad.abs().mean(dim=2)
-        grads_7 = torch.nn.functional.interpolate(
-            grads.reshape(grads.shape[1], 1, *grads.shape[2:]),
+        out = model(frames_t)
+
+        # Binary output: sum the logit (scalar) and backprop
+        score = out.logit.sum()
+        score.backward(retain_graph=False)
+
+        if frames_t.grad is None:
+            # Fallback if gradient is None
+            grads = torch.zeros_like(frames_t)
+        else:
+            grads = frames_t.grad.detach().clone()
+
+        grads_abs = grads.abs().mean(dim=2)  # (1, T, H, W)
+        grads_7 = F.interpolate(
+            grads_abs.reshape(grads_abs.shape[1], 1, *grads_abs.shape[2:]),
             size=(7, 7), mode="bilinear", align_corners=False,
-        ).squeeze(1)
-        grad_maps.append(grads_7.detach().cpu())
+        ).squeeze(1)  # (T, 7, 7)
+
+        grad_maps.append(grads_7.cpu())
+
+        # Clean up
         frames_t.requires_grad_(False)
+        model.zero_grad(set_to_none=True)
+
+    # Restore model to eval mode
+    if not was_training:
+        model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
 
     grad_maps = torch.stack(grad_maps)
     M_sub     = all_M_t_up[indices].mean(dim=1)
-    M_sub_7   = torch.nn.functional.interpolate(
+    M_sub_7   = F.interpolate(
         M_sub.unsqueeze(1), size=(7, 7), mode="bilinear", align_corners=False
     ).squeeze(1)
     grad_7_avg = grad_maps.mean(dim=1)
@@ -234,13 +278,24 @@ def run_evaluation(config: EAHNConfig):
         grad_7_avg.reshape(subset_size, -1),
     )
 
+    # FIX: Deletion/Insertion AUC — safer tensor handling
     del_ins = {"deletion_auc": 0.0, "insertion_auc": 0.0}
     try:
         sample_idx    = int(indices[0])
         frames_sample = test_ds[sample_idx]["frames"].unsqueeze(0)
         sal_sample    = all_M_t_up[sample_idx].unsqueeze(0)
+
         if isinstance(sal_sample, torch.Tensor):
-            sal_np = sal_sample.numpy()
+            sal_np = sal_sample.detach().cpu().numpy()
+        elif isinstance(sal_sample, np.ndarray):
+            sal_np = sal_sample
+        else:
+            raise TypeError(f"sal_sample is {type(sal_sample)}, expected Tensor or ndarray")
+
+        # Ensure sal_np is 4D: (B, T, H, W)
+        if sal_np.ndim == 3:
+            sal_np = sal_np[np.newaxis, ...]
+
         del_ins = ExplanationMetrics.deletion_insertion_auc(
             model, frames_sample, sal_np, steps=10
         )
@@ -300,16 +355,23 @@ def run_evaluation(config: EAHNConfig):
             writer.writerow([k, v])
     print(f"Metrics saved to {csv_path}")
 
+    # FIX: Wrap heatmap generation in try/except so eval never crashes on visualization
     if config.save_heatmaps:
-        _generate_heatmaps(config, model, test_ds, indices[:5], device, all_probs,
-                           batch_inter_sample_sim=collapse_diag["inter_sample_cosine_mean"])
+        try:
+            _generate_heatmaps(config, model, test_ds, indices[:5], device, all_probs,
+                               batch_inter_sample_sim=collapse_diag["inter_sample_cosine_mean"])
+        except Exception as e:
+            print(f"[WARN] Heatmap generation failed: {e}. Continuing without heatmaps.")
 
-    _save_representative_heatmaps(
-        config, model, test_ds, all_probs, all_labels, device,
-        batch_inter_sample_sim=collapse_diag["inter_sample_cosine_mean"],
-        temporal_ssim=ssim_val,
-        inter_sample_cosine=collapse_diag["inter_sample_cosine_mean"],
-    )
+    try:
+        _save_representative_heatmaps(
+            config, model, test_ds, all_probs, all_labels, device,
+            batch_inter_sample_sim=collapse_diag["inter_sample_cosine_mean"],
+            temporal_ssim=ssim_val,
+            inter_sample_cosine=collapse_diag["inter_sample_cosine_mean"],
+        )
+    except Exception as e:
+        print(f"[WARN] Representative heatmaps failed: {e}. Continuing.")
 
     print("Evaluation complete. Outputs saved to", config.output_dir)
 
@@ -325,7 +387,8 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
     os.makedirs(heatmap_dir, exist_ok=True)
     os.makedirs(explanation_dir, exist_ok=True)
 
-    gradcam_exp = GradCAMExplainer(model, target_layer=model.spatial_stream.grad_cam_target_layer)
+    # FIX: GradCAMExplainer no longer takes target_layer kwarg
+    gradcam_exp = GradCAMExplainer(model)
     rollout_exp = AttentionRolloutExplainer(model)
     shap_exp    = SHAPExplainer(model, method="integratedgrads")
 

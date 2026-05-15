@@ -1,12 +1,8 @@
 """
-models/eahn.py — Explanation-Aware Hybrid Network (EAHN).
-
-FIXES APPLIED:
- 1. Classifier input doubled via concatenation of cls_out + attn_pool (P0).
-    The classifier CANNOT ignore attention-derived features.
- 2. compute_gradient_saliency() preserved for evaluation faithfulness metrics.
+models/eahn.py — EAHN with non-linear classifier head and temperature annealing.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,15 +58,29 @@ class EAHN(nn.Module):
         self.cross_attention = CrossAttentionFusion(
             d_model=d,
             num_heads=config.transformer_heads,
-            temp_init=config.attn_temp_init,
+            temp_init=math.log(2.0),  # Start warmer (τ=2.0) for exploration
         )
-        # P0 FIX: classifier takes 2*d because we concatenate cls_out + attn_pool
-        self.classifier = nn.Linear(2 * d, 1)
+
+        # MLP classifier: allows non-linear interaction of cls_out + attn_pool
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * d, d),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d, 1),
+        )
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.classifier.weight)
-        nn.init.zeros_(self.classifier.bias)
+        for m in self.classifier:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def set_attention_temp(self, temp: float):
+        """External temperature control (annealing)."""
+        if hasattr(self.cross_attention, 'log_temp'):
+            with torch.no_grad():
+                self.cross_attention.log_temp.fill_(math.log(max(temp, 0.1)))
 
     def forward(self, frames: torch.Tensor) -> EAHNOutput:
         B, T, C, H, W = frames.shape
@@ -89,10 +99,10 @@ class EAHN(nn.Module):
         Q, cls_out = self.temporal_stream(spatial_tokens.reshape(B, T * N, d))
         Q = Q.reshape(B, T, N, d)
 
-        # Clamp temperature to prevent uniform attention trap (τ ∈ [1.0, 2.0])
+        # Clamp temperature to prevent explosion
         if hasattr(self.cross_attention, 'log_temp'):
             with torch.no_grad():
-                self.cross_attention.log_temp.clamp_(0.0, 0.693)
+                self.cross_attention.log_temp.clamp_(math.log(0.3), math.log(4.0))
 
         M_t, attn_pool = self.cross_attention(Q, spatial_tokens)
 
@@ -103,7 +113,6 @@ class EAHN(nn.Module):
             align_corners=False,
         ).reshape(B, T, H, W)
 
-        # P0 FIX: concatenate cls_out and attn_pool so classifier must use both
         final_feat = torch.cat([cls_out, attn_pool], dim=-1)  # (B, 2d)
         logit = self.classifier(final_feat).squeeze(-1)
         prob = torch.sigmoid(logit)
@@ -116,44 +125,24 @@ class EAHN(nn.Module):
         )
 
     def compute_gradient_saliency(self, frames: torch.Tensor):
-        """
-        Compute input-gradient saliency maps at the same resolution as M_t.
-        Preserved for evaluation metrics (faithfulness correlation).
-        NOT used during training (L_grad_align removed).
-        """
         B, T, C, H, W = frames.shape
-
-        param_states = []
-        for p in self.parameters():
-            param_states.append(p.requires_grad)
-            p.requires_grad = False
-
+        param_states = [p.requires_grad for p in self.parameters()]
         try:
+            for p in self.parameters():
+                p.requires_grad = False
             frames_in = frames.detach().clone().requires_grad_(True)
-
             with torch.enable_grad():
                 out = self(frames_in)
-
                 score = out.logit.sum() if out.logit.ndim == 1 else out.logit[:, 1].sum()
-
-                grad = torch.autograd.grad(
-                    outputs=score,
-                    inputs=frames_in,
-                    create_graph=False,
-                    retain_graph=False,
-                )[0]
-
+                grad = torch.autograd.grad(score, frames_in, create_graph=False, retain_graph=False)[0]
                 grad_spatial = grad.abs().mean(dim=2)
-
                 grad_7 = F.interpolate(
                     grad_spatial.reshape(B * T, 1, H, W),
                     size=(self.feat_h, self.feat_w),
                     mode="bilinear",
                     align_corners=False,
                 ).reshape(B, T, self.feat_h, self.feat_w)
-
         finally:
             for p, state in zip(self.parameters(), param_states):
                 p.requires_grad = state
-
         return grad_7.detach()
