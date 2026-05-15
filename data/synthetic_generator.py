@@ -2,8 +2,8 @@
 data/synthetic_generator.py — Synthetic data generation for EAHN.
 
 Contains TWO classes:
-  1. SyntheticDataGenerator — Legacy class used by datasets.py
-  2. SyntheticDataset — PyTorch Dataset for train_synthetic.py
+ 1. SyntheticDataGenerator — Legacy class used by datasets.py
+ 2. SyntheticDataset — PyTorch Dataset for train_synthetic.py
 """
 
 import os
@@ -30,7 +30,6 @@ class SyntheticDataGenerator:
         is_fake = rng.random() > 0.5
         label = 1 if is_fake else 0
         frames_list = []
-        masks_list = []
         for t in range(num_frames):
             y_grad = np.linspace(0, 1, H).reshape(-1, 1)
             x_grad = np.linspace(0, 1, W).reshape(1, -1)
@@ -52,16 +51,17 @@ class SyntheticDataGenerator:
                 mask = (mask > 0).astype(np.float32)
             else:
                 mask = np.zeros((H, W), dtype=np.float32)
+
             frame_t = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
             mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
             frame_t = (frame_t - mean) / std
             frames_list.append(frame_t)
-            masks_list.append(torch.from_numpy(mask))
-        frames = torch.stack(frames_list)
-        mask = torch.stack(masks_list)
+
+        frames = torch.stack(frames_list)          # (T, C, H, W)
+        mask_t = torch.from_numpy(mask.astype(np.float32))  # (H, W)  — FIXED: no time dim
         label_t = torch.tensor(float(label), dtype=torch.float32)
-        return frames, label_t, mask
+        return frames, label_t, mask_t
 
 
 class SyntheticDataset(Dataset):
@@ -122,16 +122,15 @@ class SyntheticDataset(Dataset):
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
         img_t = (img_t - mean) / std
 
-        mask_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
+        mask_t = torch.from_numpy(mask.astype(np.float32))  # (H, W)  — FIXED: no channel/time dim
 
-        frames = img_t.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)
-        masks = mask_t.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)
+        frames = img_t.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)   # (T, C, H, W)
 
         # FIX: Add "meta" key required by deepfake_collate_fn
         return {
             "frames": frames,
             "label": torch.tensor(float(label), dtype=torch.float32),
-            "mask": masks,
+            "mask": mask_t,  # (H, W) — single 2D mask, same across all frames
             "has_mask": torch.tensor(True, dtype=torch.bool),
             "meta": {"source": src_path, "synthetic": True, "idx": idx},
         }
