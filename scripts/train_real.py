@@ -8,6 +8,7 @@ FIXES:
 - Auto batch_size 4→2 / grad_accum 4→8 for Kaggle T4 safety
 - torch.cuda.empty_cache() between epochs
 - Explicit del out/loss after backward
+- CRITICAL FIX: torch.load with weights_only=False for PyTorch 2.6+
 """
 
 import os
@@ -118,7 +119,8 @@ def main(config: EAHNConfig):
     if config.resume_checkpoint:
         synth_ckpt = config.resume_checkpoint
     if os.path.exists(synth_ckpt):
-        ckpt = torch.load(synth_ckpt, map_location=device)
+        # CRITICAL FIX: weights_only=False for PyTorch 2.6+ compatibility
+        ckpt = torch.load(synth_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
         print(f"[INIT] Loaded synthetic checkpoint: {synth_ckpt}")
     else:
@@ -148,10 +150,11 @@ def main(config: EAHNConfig):
 
     # ── Losses ────────────────────────────────────────────────────────────
     cls_loss_fn = build_classification_loss(config)
+    # FIX: Reduced diversity_weight from 8.0 to 2.0 for stability
     exp_loss_fn = ExplanationLoss(
         alpha=config.alpha,
         beta=config.beta,
-        diversity_weight=config.attn_diversity_weight,
+        diversity_weight=2.0,  # REDUCED from 8.0
         class_sep_weight=config.class_sep_weight,
     )
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
@@ -200,6 +203,7 @@ def main(config: EAHNConfig):
                 l_exp = exp_out.loss
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
 
+                # L_exp warmup: gradually increase over first 2000 steps
                 _global_step = epoch * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 2000.0)
                 l_total = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
@@ -318,11 +322,11 @@ def main(config: EAHNConfig):
             torch.cuda.empty_cache()
 
     logger.close()
-    print(f"\nTraining complete. Best Val AUC-ROC: {best_auc:.4f}")
+    print(f"Training complete. Best Val AUC-ROC: {best_auc:.4f}")
 
     if config.eval_after_train:
         from scripts.evaluate import run_evaluation
-        print("\n--- Starting evaluation ---")
+        print("--- Starting evaluation ---")
         run_evaluation(config)
 
 
