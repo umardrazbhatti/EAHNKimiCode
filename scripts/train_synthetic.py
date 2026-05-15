@@ -1,9 +1,17 @@
 """
 scripts/train_synthetic.py — Phase 1: Pre-train on synthetic data with mask supervision.
 Run this BEFORE train_real.py.
+
+FIX: Added sys.path manipulation so script can run standalone from scripts/ directory.
 """
 
+import sys
 import os
+# Add repo root to path so imports work when running as standalone script
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import math
 import csv
 import torch
@@ -189,7 +197,4 @@ def main(config: EAHNConfig):
 if __name__ == "__main__":
     args = parse_args()
     config = EAHNConfig.from_args(args)
-    # Force synthetic-phase defaults if not overridden
-    if config.lambda1 == 1.0 and not any("--lambda1" in x for x in []):  # placeholder
-        pass
     main(config)
