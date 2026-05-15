@@ -1,9 +1,17 @@
 """
 scripts/train_real.py — Phase 2: FF++ fine-tuning with stratified batches.
 MUST load synthetic_pretrained.pth.
+
+FIX: Added sys.path manipulation so script can run standalone from scripts/ directory.
 """
 
+import sys
 import os
+# Add repo root to path so imports work when running as standalone script
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import math
 import csv
 import torch
