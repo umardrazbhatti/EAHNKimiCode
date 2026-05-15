@@ -48,7 +48,7 @@ class SyntheticDataGenerator:
                 donor_noise = rng.integers(0, 50, (H, W, 3), dtype=np.uint8)
                 mask_3 = np.stack([mask / 255.0] * 3, axis=-1)
                 frame = (frame * (1.0 - mask_3) + donor_noise * mask_3).astype(np.uint8)
-                mask = (mask > 0).astype(np.float32)
+                mask = (mask > 0).astype(np.float32)          # already 0 or 1
             else:
                 mask = np.zeros((H, W), dtype=np.float32)
 
@@ -59,7 +59,7 @@ class SyntheticDataGenerator:
             frames_list.append(frame_t)
 
         frames = torch.stack(frames_list)          # (T, C, H, W)
-        mask_t = torch.from_numpy(mask.astype(np.float32))  # (H, W)  — FIXED: no time dim
+        mask_t = torch.from_numpy(mask.astype(np.float32))  # (H, W)  — 0 or 1
         label_t = torch.tensor(float(label), dtype=torch.float32)
         return frames, label_t, mask_t
 
@@ -104,7 +104,7 @@ class SyntheticDataset(Dataset):
             angle = random.randint(-30, 30)
             cv2.ellipse(mask, (cx, cy), (ax, ay), angle, 0, 360, 255, -1)
 
-            mask_f = mask.astype(np.float32) / 255.0
+            mask_f = mask.astype(np.float32) / 255.0          # FIX: normalize to [0,1]
             mask_3 = np.stack([mask_f] * 3, axis=-1)
             img_np = (img_np * (1.0 - mask_3) + donor_np * mask_3).astype(np.uint8)
 
@@ -122,15 +122,14 @@ class SyntheticDataset(Dataset):
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
         img_t = (img_t - mean) / std
 
-        mask_t = torch.from_numpy(mask.astype(np.float32))  # (H, W)  — FIXED: no channel/time dim
+        mask_t = torch.from_numpy(mask.astype(np.float32) / 255.0)  # FIX: normalize to [0,1]
 
         frames = img_t.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)   # (T, C, H, W)
 
-        # FIX: Add "meta" key required by deepfake_collate_fn
         return {
             "frames": frames,
             "label": torch.tensor(float(label), dtype=torch.float32),
-            "mask": mask_t,  # (H, W) — single 2D mask, same across all frames
+            "mask": mask_t,  # (H, W) — single 2D mask in [0,1]
             "has_mask": torch.tensor(True, dtype=torch.bool),
             "meta": {"source": src_path, "synthetic": True, "idx": idx},
         }

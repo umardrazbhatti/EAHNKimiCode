@@ -2,12 +2,18 @@
 scripts/train_synthetic.py — Phase 1: Pre-train on synthetic data with mask supervision.
 Run this BEFORE train_real.py.
 
-FIX: Added sys.path manipulation so script can run standalone from scripts/ directory.
+FIXES:
+- sys.path manipulation for standalone execution
+- PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to prevent fragmentation OOM
+- Auto batch_size 4→2 / grad_accum 4→8 for Kaggle T4 safety
+- torch.cuda.empty_cache() between epochs
+- Explicit del out/loss after backward
 """
 
-import sys
 import os
-# Add repo root to path so imports work when running as standalone script
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -35,6 +41,14 @@ def main(config: EAHNConfig):
     print(f"[Synthetic Phase] Device: {device}")
     os.makedirs(config.output_dir, exist_ok=True)
 
+    # ── Memory safeguard for Kaggle T4 (16 GB) ───────────────────────────
+    effective_batch = config.batch_size * config.grad_accum_steps
+    if config.batch_size >= 4 and config.num_frames >= 16:
+        config.batch_size = 2
+        config.grad_accum_steps = max(1, effective_batch // config.batch_size)
+        print(f"[MEMORY] Auto-adjusted for T4: batch_size={config.batch_size}, "
+              f"grad_accum={config.grad_accum_steps} (effective={effective_batch})")
+
     # ── Dataset ─────────────────────────────────────────────────────────────
     synth_ds = SyntheticDataset(
         source_image_dir="/kaggle/working/synth_source",
@@ -42,7 +56,6 @@ def main(config: EAHNConfig):
         frame_size=config.frame_size,
         length=20000,  # 10k real + 10k fake
     )
-    # Simple 90/10 split
     n_train = int(0.9 * len(synth_ds))
     n_val = len(synth_ds) - n_train
     train_ds, val_ds = torch.utils.data.random_split(synth_ds, [n_train, n_val])
@@ -62,7 +75,6 @@ def main(config: EAHNConfig):
     # ── Model ─────────────────────────────────────────────────────────────
     model = EAHN(config).to(device)
 
-    # Unfreeze backbone immediately with full LR
     if config.freeze_backbone:
         model.spatial_stream.set_frozen(False)
         print("[Backbone] Unfrozen from start (synthetic phase)")
@@ -100,7 +112,6 @@ def main(config: EAHNConfig):
         model.train()
         running_loss = 0.0
 
-        # Anneal temperature: 2.0 → 0.5 over first 5 epochs
         target_temp = max(0.5, 2.0 * math.exp(-epoch / 2.5))
         model.set_attention_temp(target_temp)
 
@@ -119,12 +130,14 @@ def main(config: EAHNConfig):
                 l_exp = exp_out.loss
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
 
-                # In synthetic phase, L_exp is fully supervised and should dominate shaping
                 l_total = l_cls + config.lambda1 * l_exp + config.lambda2 * l_temp
 
                 if torch.isnan(l_total) or torch.isinf(l_total):
                     print(f"[WARN] NaN loss at E{epoch+1}B{batch_idx}. Skipping.")
                     optimizer.zero_grad()
+                    del out, l_total, l_cls, l_exp, l_temp
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
                     continue
 
                 loss = l_total / config.grad_accum_steps
@@ -151,6 +164,11 @@ def main(config: EAHNConfig):
                 print(f"[E{epoch+1} B{batch_idx}] L_total={l_total.item():.3f} "
                       f"L_cls={l_cls.item():.3f} L_exp={l_exp.item():.3f} "
                       f"tau={target_temp:.2f} M_std={out.M_t.std().item():.3f}")
+
+            # Explicit cleanup to prevent CUDA fragmentation
+            del out, loss, l_total, l_cls, l_exp, l_temp
+            if device.type == 'cuda' and batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
 
         # Step leftover gradients
         if len(train_loader) % config.grad_accum_steps != 0:
@@ -183,12 +201,17 @@ def main(config: EAHNConfig):
                 val_loss += l_total.item()
 
         avg_val_loss = val_loss / max(len(val_loader), 1)
-        print(f"[Epoch {epoch+1}/{config.epochs}] TrainLoss: {avg_train_loss:.4f} | ValLoss: {avg_val_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+        print(f"[Epoch {epoch+1}/{config.epochs}] TrainLoss: {avg_train_loss:.4f} | "
+              f"ValLoss: {avg_val_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
         if avg_val_loss < best_val:
             best_val = avg_val_loss
             save_checkpoint(model, optimizer, scheduler, epoch, best_val, config, ckpt_path)
             print(f"--> Best synthetic checkpoint saved")
+
+        # Free memory between epochs
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     logger.close()
     print(f"\nSynthetic pre-training complete. Checkpoint: {ckpt_path}")

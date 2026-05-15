@@ -2,12 +2,18 @@
 scripts/train_real.py — Phase 2: FF++ fine-tuning with stratified batches.
 MUST load synthetic_pretrained.pth.
 
-FIX: Added sys.path manipulation so script can run standalone from scripts/ directory.
+FIXES:
+- sys.path manipulation for standalone execution
+- PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+- Auto batch_size 4→2 / grad_accum 4→8 for Kaggle T4 safety
+- torch.cuda.empty_cache() between epochs
+- Explicit del out/loss after backward
 """
 
-import sys
 import os
-# Add repo root to path so imports work when running as standalone script
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -42,7 +48,6 @@ class StratifiedBatchSampler(Sampler):
         self.fake_idx = np.where(labels == 1)[0].tolist()
         self.batch_size = batch_size
 
-        # Default: at least 1 real per batch (critical for 5:1 imbalance with batch=4)
         if num_real_per_batch is None:
             self.num_real = max(1, batch_size // 4)
         else:
@@ -75,12 +80,19 @@ def main(config: EAHNConfig):
     print(f"[FF++ Phase] Device: {device}")
     os.makedirs(config.output_dir, exist_ok=True)
 
+    # ── Memory safeguard for Kaggle T4 (16 GB) ───────────────────────────
+    effective_batch = config.batch_size * config.grad_accum_steps
+    if config.batch_size >= 4 and config.num_frames >= 16:
+        config.batch_size = 2
+        config.grad_accum_steps = max(1, effective_batch // config.batch_size)
+        print(f"[MEMORY] Auto-adjusted for T4: batch_size={config.batch_size}, "
+              f"grad_accum={config.grad_accum_steps} (effective={effective_batch})")
+
     # ── Data ──────────────────────────────────────────────────────────────
     train_ds = DeepfakeDataset(config, "train", config.dataset_name)
     val_ds = DeepfakeDataset(config, "val", config.dataset_name)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    # STRATIFIED SAMPLER: 1 real + 3 fake per batch (batch_size=4)
     sampler = StratifiedBatchSampler(train_ds, config.batch_size, num_real_per_batch=1)
     train_loader = DataLoader(
         train_ds, batch_sampler=sampler,
@@ -93,7 +105,6 @@ def main(config: EAHNConfig):
         pin_memory=(device.type == "cuda"),
     )
 
-    # ── Smoke check ───────────────────────────────────────────────────────
     _sb = next(iter(train_loader))
     _bl = _sb["label"].cpu().numpy().astype(int)
     _n_real, _n_fake = int((_bl == 0).sum()), int((_bl == 1).sum())
@@ -103,7 +114,6 @@ def main(config: EAHNConfig):
     # ── Model ─────────────────────────────────────────────────────────────
     model = EAHN(config).to(device)
 
-    # Load synthetic pre-trained weights
     synth_ckpt = os.path.join(config.output_dir, "synthetic_pretrained.pth")
     if config.resume_checkpoint:
         synth_ckpt = config.resume_checkpoint
@@ -114,7 +124,6 @@ def main(config: EAHNConfig):
     else:
         print("[WARN] No synthetic checkpoint found. Training from scratch — expect poor results.")
 
-    # Backbone unfrozen immediately with FULL LR
     if config.freeze_backbone:
         model.spatial_stream.set_frozen(False)
     backbone_lr = config.lr * config.backbone_lr_ratio
@@ -156,7 +165,6 @@ def main(config: EAHNConfig):
             "val_auc", "val_f1", "val_real_acc", "val_fake_acc", "lr"
         ])
 
-    # ── Training loop ───────────────────────────────────────────────────
     import contextlib
     best_auc = -1.0
     patience_counter = 0
@@ -167,7 +175,6 @@ def main(config: EAHNConfig):
         epoch_real_correct = epoch_real_total = 0
         epoch_fake_correct = epoch_fake_total = 0
 
-        # Anneal attention temp: 1.5 → 0.5 over epochs
         target_temp = max(0.5, 1.5 * math.exp(-epoch / 3.0))
         model.set_attention_temp(target_temp)
 
@@ -183,6 +190,9 @@ def main(config: EAHNConfig):
 
                 if torch.isnan(out.logit).any() or torch.isinf(out.logit).any():
                     optimizer.zero_grad()
+                    del out
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
                     continue
 
                 l_cls = cls_loss_fn(out.logit, labels)
@@ -190,13 +200,15 @@ def main(config: EAHNConfig):
                 l_exp = exp_out.loss
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
 
-                # CRITICAL: lambda1 is now 0.05. Classification dominates.
                 _global_step = epoch * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 2000.0)
                 l_total = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
 
                 if torch.isnan(l_total) or torch.isinf(l_total):
                     optimizer.zero_grad()
+                    del out, l_total, l_cls, l_exp, l_temp
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
                     continue
 
                 loss = l_total / config.grad_accum_steps
@@ -230,6 +242,11 @@ def main(config: EAHNConfig):
 
             running_loss += l_total.item()
 
+            # Explicit cleanup
+            del out, loss, l_total, l_cls, l_exp, l_temp
+            if device.type == 'cuda' and batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
+
         # Leftover step
         if len(train_loader) % config.grad_accum_steps != 0:
             if use_amp:
@@ -261,7 +278,6 @@ def main(config: EAHNConfig):
         val_auc = metrics.get("auc_roc", float("nan"))
         val_f1 = metrics.get("f1", 0.0)
 
-        # Per-class val accuracy
         probs_arr = np.array(probs_list)
         labels_arr = np.array(labels_list, dtype=int)
         preds_arr = (probs_arr >= 0.5).astype(int)
@@ -286,7 +302,6 @@ def main(config: EAHNConfig):
                 f"{optimizer.param_groups[0]['lr']:.2e}",
             ])
 
-        # Early stopping
         if not math.isnan(val_auc) and val_auc > best_auc:
             best_auc = val_auc
             patience_counter = 0
@@ -298,6 +313,9 @@ def main(config: EAHNConfig):
             if patience_counter >= config.patience:
                 print(f"Early stopping at epoch {epoch+1}")
                 break
+
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     logger.close()
     print(f"\nTraining complete. Best Val AUC-ROC: {best_auc:.4f}")
