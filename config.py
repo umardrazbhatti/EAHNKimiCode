@@ -42,7 +42,7 @@ class EAHNConfig:
     beta: float = 0.5
     gamma: float = 0.1
     attn_temp_init: float = 0.0
-    attn_diversity_weight: float = 8.0
+    attn_diversity_weight: float = 2.0
     cls_dropout_p: float = 0.0
     lambda_grad_align: float = 0.0       # REMOVED
     label_smoothing: float = 0.02
