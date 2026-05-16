@@ -1,336 +1,224 @@
-"""
-scripts/train_real.py — Phase 2: FF++ fine-tuning with stratified batches.
-MUST load synthetic_pretrained.pth.
-
-FIXES:
-- sys.path manipulation for standalone execution
-- PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-- Auto batch_size 4→2 / grad_accum 4→8 for Kaggle T4 safety
-- torch.cuda.empty_cache() between epochs
-- Explicit del out/loss after backward
-- CRITICAL FIX: torch.load with weights_only=False for PyTorch 2.6+
-"""
-
 import os
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-
 import sys
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-import math
-import csv
 import torch
-import numpy as np
-from torch.utils.data import DataLoader, Sampler
-from torch.amp import GradScaler, autocast
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from typing import Optional
 
-from config import EAHNConfig, parse_args
-from data.datasets import DeepfakeDataset
-from data.collate import deepfake_collate_fn
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from config import EAHNConfig
 from models.eahn import EAHN
-from losses.classification import build_classification_loss
 from losses.explanation import ExplanationLoss
 from losses.temporal import TemporalConsistencyLoss
-from metrics.detection import DetectionMetrics
+from data.datasets import DeepfakeDataset
 from utils.checkpointing import save_checkpoint, load_checkpoint
-from utils.logging_utils import Logger
+from metrics.detection import DetectionMetrics
 
 
-class StratifiedBatchSampler(Sampler):
-    """
-    Guarantees every batch contains exactly num_real real samples and
-    (batch_size - num_real) fake samples. Eliminates all-real or all-fake batches.
-    """
-    def __init__(self, dataset, batch_size, num_real_per_batch=None):
-        labels = np.array([s["label"] for s in dataset.samples], dtype=int)
-        self.real_idx = np.where(labels == 0)[0].tolist()
-        self.fake_idx = np.where(labels == 1)[0].tolist()
-        self.batch_size = batch_size
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: ExplanationLoss,
+    temporal_criterion: TemporalConsistencyLoss,
+    device: torch.device,
+    epoch: int,
+    lambda1: float,
+    lambda2: float,
+    warmup_steps: int = 500,
+) -> dict:
+    model.train()
+    running_loss = 0.0
+    running_cls = 0.0
+    running_exp = 0.0
+    running_temp = 0.0
+    global_step = epoch * len(dataloader)
 
-        if num_real_per_batch is None:
-            self.num_real = max(1, batch_size // 4)
-        else:
-            self.num_real = num_real_per_batch
-        self.num_fake = batch_size - self.num_real
+    pbar = tqdm(dataloader, desc=f"Real Epoch {epoch}")
+    for batch_idx, batch in enumerate(pbar):
+        step = global_step + batch_idx
 
-        self.num_batches = min(
-            len(self.real_idx) // self.num_real,
-            len(self.fake_idx) // self.num_fake,
-        )
-        self.length = self.num_batches
+        frames = batch["frames"].to(device)   # (B, T, C, H, W)
+        labels = batch["label"].to(device)    # (B,)
 
-    def __iter__(self):
-        np.random.shuffle(self.real_idx)
-        np.random.shuffle(self.fake_idx)
-        for i in range(self.num_batches):
-            batch = (
-                self.real_idx[i * self.num_real : (i + 1) * self.num_real] +
-                self.fake_idx[i * self.num_fake : (i + 1) * self.num_fake]
-            )
-            np.random.shuffle(batch)
-            yield batch
+        B, T, C, H, W = frames.shape
+        frames_flat = frames.view(B * T, C, H, W)
 
-    def __len__(self):
-        return self.length
+        optimizer.zero_grad()
+
+        outputs = model(frames_flat)
+        logits = outputs["logits"].view(B, T, -1).mean(dim=1).squeeze(-1)  # (B,)
+        attn = outputs["attention"].view(B, T, 1, H, W).mean(dim=1)        # (B, 1, H, W)
+
+        # Warmup for L_exp
+        lambda1_eff = lambda1 * min(1.0, step / warmup_steps)
+
+        loss_dict = criterion(logits, labels, attn, None)
+        L_cls_exp = loss_dict["loss"]
+
+        # Temporal consistency across frames
+        attn_temporal = outputs["attention"].view(B, T, 1, H, W)
+        L_temp = temporal_criterion(attn_temporal)
+
+        total_loss = L_cls_exp + lambda2 * L_temp
+
+        if torch.isnan(total_loss) or total_loss.item() > 100.0:
+            print(f"[SKIP] Bad loss {total_loss.item():.4f} at step {step}")
+            optimizer.zero_grad()
+            continue
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        running_loss += total_loss.item()
+        running_cls += loss_dict["L_cls"].item()
+        running_exp += loss_dict["L_exp"].item()
+        running_temp += L_temp.item()
+
+        pbar.set_postfix({
+            "loss": f"{total_loss.item():.4f}",
+            "L_cls": f"{loss_dict['L_cls'].item():.4f}",
+            "L_exp": f"{loss_dict['L_exp'].item():.4f}",
+            "L_temp": f"{L_temp.item():.4f}",
+        })
+
+    n = len(dataloader)
+    return {
+        "loss": running_loss / n,
+        "L_cls": running_cls / n,
+        "L_exp": running_exp / n,
+        "L_temp": running_temp / n,
+    }
 
 
-def main(config: EAHNConfig):
-    device = torch.device(config.device)
-    print(f"[FF++ Phase] Device: {device}")
-    os.makedirs(config.output_dir, exist_ok=True)
+@torch.no_grad()
+def validate(model, dataloader, criterion, temporal_criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds, all_labels = [], []
 
-    # ── Memory safeguard for Kaggle T4 (16 GB) ───────────────────────────
-    effective_batch = config.batch_size * config.grad_accum_steps
-    if config.batch_size >= 4 and config.num_frames >= 16:
-        config.batch_size = 2
-        config.grad_accum_steps = max(1, effective_batch // config.batch_size)
-        print(f"[MEMORY] Auto-adjusted for T4: batch_size={config.batch_size}, "
-              f"grad_accum={config.grad_accum_steps} (effective={effective_batch})")
+    for batch in tqdm(dataloader, desc="Val"):
+        frames = batch["frames"].to(device)
+        labels = batch["label"].to(device)
+        B, T, C, H, W = frames.shape
+        frames_flat = frames.view(B * T, C, H, W)
 
-    # ── Data ──────────────────────────────────────────────────────────────
-    train_ds = DeepfakeDataset(config, "train", config.dataset_name)
-    val_ds = DeepfakeDataset(config, "val", config.dataset_name)
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
+        outputs = model(frames_flat)
+        logits = outputs["logits"].view(B, T, -1).mean(dim=1).squeeze(-1)
+        attn = outputs["attention"].view(B, T, 1, H, W).mean(dim=1)
 
-    sampler = StratifiedBatchSampler(train_ds, config.batch_size, num_real_per_batch=1)
+        loss_dict = criterion(logits, labels, attn, None)
+        L_temp = temporal_criterion(outputs["attention"].view(B, T, 1, H, W))
+        total_loss = loss_dict["loss"] + L_temp
+
+        running_loss += total_loss.item()
+        probs = torch.sigmoid(logits)
+        all_preds.extend(probs.cpu().numpy().tolist())
+        all_labels.extend(labels.cpu().numpy().tolist())
+
+    metrics = DetectionMetrics()
+    results = metrics.compute(all_preds, all_labels)
+
+    return {
+        "loss": running_loss / len(dataloader),
+        "auc": results.get("auc", 0.0),
+        "accuracy": results.get("accuracy", 0.0),
+    }
+
+
+def main(cfg: Optional[EAHNConfig] = None):
+    if cfg is None:
+        cfg = EAHNConfig()
+
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    print(f"[Phase 2] Real-data Fine-tuning on {device}")
+
+    # Load synthetic checkpoint
+    synth_ckpt = os.path.join(cfg.checkpoint_dir, "synthetic_final.pth")
+    if not os.path.exists(synth_ckpt):
+        raise FileNotFoundError(f"Synthetic checkpoint not found: {synth_ckpt}")
+
+    model = EAHN(
+        num_classes=cfg.num_classes,
+        backbone=cfg.backbone,
+        temporal_dim=cfg.temporal_dim,
+    ).to(device)
+
+    # FIXED: PyTorch 2.6 weights_only=False
+    ckpt = torch.load(synth_ckpt, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    print(f"Loaded synthetic checkpoint from {synth_ckpt}")
+
+    # FIXED: diversity_weight 8.0 -> 2.0
+    criterion = ExplanationLoss(
+        diversity_weight=cfg.attn_diversity_weight,
+        entropy_weight=cfg.attn_entropy_weight,
+        class_sep_weight=cfg.attn_class_sep_weight,
+    )
+    temporal_criterion = TemporalConsistencyLoss()
+
+    # Build FF++ dataset
+    train_dataset = DeepfakeDataset(
+        root=cfg.ffpp_root,
+        split="train",
+        frames_per_clip=cfg.frames_per_clip,
+    )
+    val_dataset = DeepfakeDataset(
+        root=cfg.ffpp_root,
+        split="val",
+        frames_per_clip=cfg.frames_per_clip,
+    )
+
     train_loader = DataLoader(
-        train_ds, batch_sampler=sampler,
-        num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
-        pin_memory=(device.type == "cuda"),
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=config.batch_size,
-        num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
-        pin_memory=(device.type == "cuda"),
+        val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
     )
 
-    _sb = next(iter(train_loader))
-    _bl = _sb["label"].cpu().numpy().astype(int)
-    _n_real, _n_fake = int((_bl == 0).sum()), int((_bl == 1).sum())
-    print(f"[Smoke] First batch: real={_n_real} fake={_n_fake}")
-    assert _n_real > 0 and _n_fake > 0, "Stratified sampler failed."
-
-    # ── Model ─────────────────────────────────────────────────────────────
-    model = EAHN(config).to(device)
-
-    synth_ckpt = os.path.join(config.output_dir, "synthetic_pretrained.pth")
-    if config.resume_checkpoint:
-        synth_ckpt = config.resume_checkpoint
-    if os.path.exists(synth_ckpt):
-        # CRITICAL FIX: weights_only=False for PyTorch 2.6+ compatibility
-        ckpt = torch.load(synth_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
-        print(f"[INIT] Loaded synthetic checkpoint: {synth_ckpt}")
-    else:
-        print("[WARN] No synthetic checkpoint found. Training from scratch — expect poor results.")
-
-    if config.freeze_backbone:
-        model.spatial_stream.set_frozen(False)
-    backbone_lr = config.lr * config.backbone_lr_ratio
-    optimizer = torch.optim.AdamW([
-        {"params": [p for n, p in model.named_parameters() if n.startswith("spatial_stream.backbone.")],
-         "lr": backbone_lr, "weight_decay": config.weight_decay},
-        {"params": [p for n, p in model.named_parameters() if not n.startswith("spatial_stream.backbone.")],
-         "lr": config.lr, "weight_decay": config.weight_decay},
-    ])
-
-    def lr_lambda(epoch):
-        if epoch < config.warmup_epochs:
-            return (epoch + 1) / (config.warmup_epochs + 1)
-        progress = (epoch - config.warmup_epochs) / max(config.epochs - config.warmup_epochs, 1)
-        return 0.5 * (1 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    use_amp = config.mixed_precision and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7
-    scaler = GradScaler("cuda") if use_amp else None
-    logger = Logger(config.output_dir)
-
-    # ── Losses ────────────────────────────────────────────────────────────
-    cls_loss_fn = build_classification_loss(config)
-    # FIX: Reduced diversity_weight from 8.0 to 2.0 for stability
-    exp_loss_fn = ExplanationLoss(
-        alpha=config.alpha,
-        beta=config.beta,
-        diversity_weight=2.0,  # REDUCED from 8.0
-        class_sep_weight=config.class_sep_weight,
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr_phase2,
+        weight_decay=cfg.weight_decay,
     )
-    temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
-    ckpt_path = os.path.join(config.output_dir, "best_model.pth")
+    best_auc = 0.0
+    for epoch in range(1, cfg.epochs_phase2 + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, criterion, temporal_criterion,
+            device, epoch, lambda1=cfg.lambda1, lambda2=cfg.lambda2,
+        )
+        print(f"[Epoch {epoch}] Train Loss: {train_metrics['loss']:.4f} | "
+              f"L_cls: {train_metrics['L_cls']:.4f} | L_exp: {train_metrics['L_exp']:.4f} | "
+              f"L_temp: {train_metrics['L_temp']:.4f}")
 
-    metrics_csv_path = os.path.join(config.output_dir, "train_metrics.csv")
-    with open(metrics_csv_path, "w", newline="") as f:
-        csv.writer(f).writerow([
-            "epoch", "train_loss", "train_real_acc", "train_fake_acc",
-            "val_auc", "val_f1", "val_real_acc", "val_fake_acc", "lr"
-        ])
+        val_metrics = validate(model, val_loader, criterion, temporal_criterion, device)
+        print(f"[Epoch {epoch}] Val Loss: {val_metrics['loss']:.4f} | AUC: {val_metrics['auc']:.4f}")
 
-    import contextlib
-    best_auc = -1.0
-    patience_counter = 0
+        if val_metrics["auc"] > best_auc:
+            best_auc = val_metrics["auc"]
+            save_checkpoint(
+                model, optimizer, epoch,
+                filepath=os.path.join(cfg.checkpoint_dir, "best_real.pth"),
+            )
 
-    for epoch in range(config.epochs):
-        model.train()
-        running_loss = 0.0
-        epoch_real_correct = epoch_real_total = 0
-        epoch_fake_correct = epoch_fake_total = 0
-
-        target_temp = max(0.5, 1.5 * math.exp(-epoch / 3.0))
-        model.set_attention_temp(target_temp)
-
-        for batch_idx, batch in enumerate(train_loader):
-            frames = batch["frames"].to(device)
-            labels = batch["label"].to(device)
-            masks = batch["mask"].to(device)
-            has_mask = batch["has_mask"].to(device)
-
-            ctx = autocast("cuda") if use_amp else contextlib.nullcontext()
-            with ctx:
-                out = model(frames)
-
-                if torch.isnan(out.logit).any() or torch.isinf(out.logit).any():
-                    optimizer.zero_grad()
-                    del out
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
-                    continue
-
-                l_cls = cls_loss_fn(out.logit, labels)
-                exp_out = exp_loss_fn(out.M_t, masks, has_mask, labels=labels)
-                l_exp = exp_out.loss
-                l_temp = temp_loss_fn(out.M_t, out.low_level)
-
-                # L_exp warmup: gradually increase over first 2000 steps
-                _global_step = epoch * len(train_loader) + batch_idx
-                _lambda1_eff = config.lambda1 * min(1.0, _global_step / 2000.0)
-                l_total = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
-
-                if torch.isnan(l_total) or torch.isinf(l_total):
-                    optimizer.zero_grad()
-                    del out, l_total, l_cls, l_exp, l_temp
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
-                    continue
-
-                loss = l_total / config.grad_accum_steps
-
-            if use_amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            if (batch_idx + 1) % config.grad_accum_steps == 0:
-                if use_amp:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                if use_amp:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad()
-
-            with torch.no_grad():
-                preds = (out.prob >= 0.5).float()
-                real_mask = (labels == 0)
-                fake_mask = (labels == 1)
-                if real_mask.any():
-                    epoch_real_correct += (preds[real_mask] == labels[real_mask]).sum().item()
-                    epoch_real_total += real_mask.sum().item()
-                if fake_mask.any():
-                    epoch_fake_correct += (preds[fake_mask] == labels[fake_mask]).sum().item()
-                    epoch_fake_total += fake_mask.sum().item()
-
-            running_loss += l_total.item()
-
-            # Explicit cleanup
-            del out, loss, l_total, l_cls, l_exp, l_temp
-            if device.type == 'cuda' and batch_idx % 50 == 0:
-                torch.cuda.empty_cache()
-
-        # Leftover step
-        if len(train_loader) % config.grad_accum_steps != 0:
-            if use_amp:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad()
-
-        scheduler.step()
-        real_acc = epoch_real_correct / max(epoch_real_total, 1)
-        fake_acc = epoch_fake_correct / max(epoch_fake_total, 1)
-        avg_train_loss = running_loss / max(len(train_loader), 1)
-
-        # ── Validation ────────────────────────────────────────────────────
-        model.eval()
-        probs_list, labels_list = [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                frames = batch["frames"].to(device)
-                out = model(frames)
-                probs_list.extend(out.prob.cpu().tolist())
-                labels_list.extend(batch["label"].cpu().tolist())
-
-        metrics = DetectionMetrics.compute(probs_list, labels_list)
-        val_auc = metrics.get("auc_roc", float("nan"))
-        val_f1 = metrics.get("f1", 0.0)
-
-        probs_arr = np.array(probs_list)
-        labels_arr = np.array(labels_list, dtype=int)
-        preds_arr = (probs_arr >= 0.5).astype(int)
-        from sklearn.metrics import confusion_matrix
-        cm = confusion_matrix(labels_arr, preds_arr)
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-            val_real_acc = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-            val_fake_acc = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        else:
-            val_real_acc = val_fake_acc = 0.0
-
-        print(f"Epoch {epoch+1}/{config.epochs} | "
-              f"TrainLoss: {avg_train_loss:.4f} | RealAcc: {real_acc:.3f} | FakeAcc: {fake_acc:.3f} | "
-              f"ValAUC: {val_auc:.4f} | ValF1: {val_f1:.4f} | "
-              f"ValReal: {val_real_acc:.3f} | ValFake: {val_fake_acc:.3f}")
-
-        with open(metrics_csv_path, "a", newline="") as f:
-            csv.writer(f).writerow([
-                epoch + 1, f"{avg_train_loss:.4f}", f"{real_acc:.4f}", f"{fake_acc:.4f}",
-                f"{val_auc:.4f}", f"{val_f1:.4f}", f"{val_real_acc:.4f}", f"{val_fake_acc:.4f}",
-                f"{optimizer.param_groups[0]['lr']:.2e}",
-            ])
-
-        if not math.isnan(val_auc) and val_auc > best_auc:
-            best_auc = val_auc
-            patience_counter = 0
-            save_checkpoint(model, optimizer, scheduler, epoch, best_auc, config, ckpt_path)
-            print(f"--> Best model saved (AUC: {best_auc:.4f})")
-        else:
-            patience_counter += 1
-            print(f"--> No improvement. Patience: {patience_counter}/{config.patience}")
-            if patience_counter >= config.patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-    logger.close()
-    print(f"Training complete. Best Val AUC-ROC: {best_auc:.4f}")
-
-    if config.eval_after_train:
-        from scripts.evaluate import run_evaluation
-        print("--- Starting evaluation ---")
-        run_evaluation(config)
+    save_checkpoint(
+        model, optimizer, cfg.epochs_phase2,
+        filepath=os.path.join(cfg.checkpoint_dir, "real_final.pth"),
+    )
+    print("[Phase 2] Complete.")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    config = EAHNConfig.from_args(args)
-    main(config)
+    main()

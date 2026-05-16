@@ -1,162 +1,118 @@
-"""
-losses/explanation.py — L_exp:
-  * Supervised (has pixel mask): MSE(M_t_avg, gt_mask)
-  * Weak supervision (no mask): α·Entropy(M_t) + β·TV(M_t) + diversity_weight·l_div
-    + class_sep_weight·l_class_sep
-
-CRITICAL FIXES (v3):
- 1. Added epsilon to ALL divisions to prevent division by zero
- 2. Added gradient clipping inside loss to prevent explosion
- 3. Added L_exp warmup support (caller scales lambda1)
- 4. Fixed entropy computation to use log() safely
- 5. Added numerical stability checks with torch.nan_to_num
- 6. Diversity hinge 0.2 → 0.3 (was too aggressive, caused collapse)
- 7. Class-separation hinge 0.05 → 0.1 (less extreme)
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
-@dataclass
-class ExplanationLossOutput:
-    loss: torch.Tensor
-    l_h: float
-    l_tv: float
-    l_div: float
-    l_class_sep: float
-    inter_sample_sim: float
 
 class ExplanationLoss(nn.Module):
-    def __init__(self, alpha: float = 0.5, beta: float = 0.5,
-                 diversity_weight: float = 2.0,  # REDUCED from 8.0
-                 class_sep_weight: float = 0.5):
+    """
+    Explanation loss for EAHN with numerical stability fixes.
+    Computes:
+      - L_cls: classification loss (BCE)
+      - L_exp: explanation loss = entropy + diversity + class_separation
+    """
+    def __init__(
+        self,
+        diversity_weight: float = 2.0,      # FIXED: 8.0 -> 2.0
+        entropy_weight: float = 1.0,
+        class_sep_weight: float = 1.0,
+        diversity_hinge: float = 0.3,         # FIXED: 0.2 -> 0.3
+        class_sep_hinge: float = 0.1,         # FIXED: 0.05 -> 0.1
+        eps: float = 1e-6,                    # FIXED: added global eps
+    ):
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
         self.diversity_weight = diversity_weight
+        self.entropy_weight = entropy_weight
         self.class_sep_weight = class_sep_weight
-        self.eps = 1e-6  # Global epsilon for stability
+        self.diversity_hinge = diversity_hinge
+        self.class_sep_hinge = class_sep_hinge
+        self.eps = eps
 
     def forward(
         self,
-        M_t: torch.Tensor,
-        masks: torch.Tensor,
-        has_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-    ) -> ExplanationLossOutput:
-        B, T, h, w = M_t.shape
+        predictions: torch.Tensor,
+        labels: torch.Tensor,
+        attention_maps: torch.Tensor,
+        masks: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            predictions: (B,) logits or probabilities
+            labels: (B,) binary labels {0, 1}
+            attention_maps: (B, 1, H, W) attention weights (after softmax)
+            masks: (B, 1, H, W) ground-truth masks [0, 1]
+        Returns:
+            dict with 'loss', 'L_cls', 'L_exp', 'L_entropy', 'L_diversity', 'L_class_sep'
+        """
+        eps = self.eps
 
-        # Initialize loss with proper device/dtype
-        loss = torch.tensor(0.0, device=M_t.device, dtype=M_t.dtype)
-
-        l_h_acc = 0.0
-        l_tv_acc = 0.0
-
-        for i in range(B):
-            m_avg = M_t[i].mean(0)  # (h, w)
-
-            if has_mask[i]:
-                gt = masks[i]
-                # Handle various gt shapes safely
-                if gt.dim() == 2 and gt.shape == (h, w):
-                    pass  # Perfect match
-                elif gt.dim() == 3 and gt.shape[0] == 1:
-                    gt = gt.squeeze(0)
-                    if gt.shape != (h, w):
-                        gt = F.interpolate(
-                            gt.unsqueeze(0).unsqueeze(0).float(),
-                            size=(h, w), mode='bilinear', align_corners=False
-                        ).squeeze()
-                else:
-                    gt = F.interpolate(
-                        gt.unsqueeze(0).unsqueeze(0).float(),
-                        size=(h, w), mode='bilinear', align_corners=False
-                    ).squeeze()
-
-                # Clamp for safety
-                gt = torch.clamp(gt, 0.0, 1.0)
-                m_avg = torch.clamp(m_avg, 0.0, 1.0)
-
-                mse = F.mse_loss(m_avg, gt)
-                loss = loss + mse
-            else:
-                # Entropy: encourage peaked attention (not uniform)
-                m_flat = m_avg.flatten()
-                # Safe clamp before log
-                m_flat = torch.clamp(m_flat, self.eps, 1.0 - self.eps)
-                entropy = -(m_flat * torch.log(m_flat)).sum()
-                # Normalize by size so entropy is comparable across resolutions
-                entropy = entropy / (h * w)
-
-                # Total variation: encourage spatial smoothness
-                tv_h = (M_t[i, :, :, 1:] - M_t[i, :, :, :-1]).abs().mean()
-                tv_w = (M_t[i, :, 1:, :] - M_t[i, :, :-1, :]).abs().mean()
-                tv = (tv_h + tv_w) / 2.0  # Average for stability
-
-                loss = loss + (self.alpha * entropy + self.beta * tv)
-                l_h_acc += entropy.item()
-                l_tv_acc += tv.item()
-
-        # Average over batch
-        loss = loss / max(B, 1)
-
-        # ── Inter-sample diversity (PER-SAMPLE centroids) ────────────────
-        M_per_sample = M_t.mean(dim=1)  # (B, h, w)
-        flat = M_per_sample.reshape(B, h * w)
-
-        # Safe normalization
-        norms = flat.norm(dim=-1, keepdim=True)
-        flat = flat / (norms + self.eps)
-
-        sim_matrix = flat @ flat.T  # (B, B)
-        eye = torch.eye(B, dtype=torch.bool, device=M_t.device)
-        n_pairs = B * (B - 1)
-
-        # Mask diagonal, compute mean similarity
-        sim_masked = sim_matrix.masked_fill(eye, 0.0)
-        inter_sample_sim = float(
-            sim_masked.sum().item() / max(n_pairs, 1)
+        # --- Classification Loss ---
+        L_cls = F.binary_cross_entropy_with_logits(
+            predictions, labels.float(), reduction="mean"
         )
 
-        # Diversity loss: penalize if average similarity > hinge
-        # FIX: hinge 0.2 → 0.3 (less aggressive, prevents collapse)
-        l_div_tensor = F.relu(
-            sim_masked.sum() / max(n_pairs, 1) - 0.3
-        )
-        loss = loss + self.diversity_weight * l_div_tensor
+        B, _, H, W = attention_maps.shape
+        attn = attention_maps.view(B, -1)  # (B, H*W)
 
-        # ── Class-conditional separation ─────────────────────────────────
-        l_class_sep = torch.tensor(0.0, device=M_t.device, dtype=M_t.dtype)
-        if labels is not None and B >= 2:
+        # --- Entropy Loss (encourage peaky attention) ---
+        # Normalize by map size so it doesn't scale with 224x224=50176
+        attn_safe = torch.clamp(attn, min=eps, max=1.0)
+        entropy = -(attn_safe * torch.log(attn_safe + eps)).sum(dim=1).mean()
+        L_entropy = entropy / (H * W)  # FIXED: normalize by spatial size
+
+        # --- Diversity Loss (push different samples apart) ---
+        if B > 1:
+            # Pairwise cosine similarity matrix
+            attn_norm = F.normalize(attn, p=2, dim=1)  # (B, H*W)
+            sim_matrix = torch.mm(attn_norm, attn_norm.t())  # (B, B)
+
+            # Mask out diagonal
+            mask_diag = torch.eye(B, device=sim_matrix.device).bool()
+            sim_offdiag = sim_matrix.masked_fill(mask_diag, 0.0)
+
+            # Hinge: penalize if similarity > threshold
+            diversity = F.relu(sim_offdiag - self.diversity_hinge).mean()
+        else:
+            diversity = torch.tensor(0.0, device=attn.device)
+
+        L_diversity = diversity
+
+        # --- Class Separation Loss (push real/fake attention apart) ---
+        if B > 1 and labels.unique().numel() > 1:
             real_mask = (labels == 0)
             fake_mask = (labels == 1)
-            if real_mask.sum() >= 1 and fake_mask.sum() >= 1:
-                real_cent = flat[real_mask].mean(dim=0, keepdim=True)
-                fake_cent = flat[fake_mask].mean(dim=0, keepdim=True)
+            if real_mask.sum() > 0 and fake_mask.sum() > 0:
+                real_attn = attn[real_mask].mean(dim=0)   # (H*W,)
+                fake_attn = attn[fake_mask].mean(dim=0)     # (H*W,)
 
-                # Safe cosine similarity
-                real_norm = real_cent.norm(dim=-1, keepdim=True)
-                fake_norm = fake_cent.norm(dim=-1, keepdim=True)
-                real_cent = real_cent / (real_norm + self.eps)
-                fake_cent = fake_cent / (fake_norm + self.eps)
+                real_norm = F.normalize(real_attn.unsqueeze(0), p=2, dim=1)
+                fake_norm = F.normalize(fake_attn.unsqueeze(0), p=2, dim=1)
+                class_sim = torch.mm(real_norm, fake_norm.t()).squeeze()
 
-                sim = F.cosine_similarity(real_cent, fake_cent, dim=-1)
-                # FIX: hinge 0.05 → 0.1 (less extreme)
-                l_class_sep = F.relu(sim - 0.1)
-                loss = loss + self.class_sep_weight * l_class_sep
+                L_class_sep = F.relu(class_sim - self.class_sep_hinge)
+            else:
+                L_class_sep = torch.tensor(0.0, device=attn.device)
+        else:
+            L_class_sep = torch.tensor(0.0, device=attn.device)
 
-        # Final numerical safety
-        loss = torch.nan_to_num(loss, nan=0.0, posinf=10.0, neginf=-10.0)
-        loss = torch.clamp(loss, -10.0, 10.0)
-
-        return ExplanationLossOutput(
-            loss=loss,
-            l_h=l_h_acc / max(B, 1),
-            l_tv=l_tv_acc / max(B, 1),
-            l_div=float(l_div_tensor.item()),
-            l_class_sep=float(l_class_sep.item()),
-            inter_sample_sim=inter_sample_sim,
+        # --- Combine ---
+        L_exp = (
+            self.entropy_weight * L_entropy
+            + self.diversity_weight * L_diversity
+            + self.class_sep_weight * L_class_sep
         )
+
+        total_loss = L_cls + L_exp
+
+        # --- Numerical Safety ---
+        total_loss = torch.nan_to_num(total_loss, nan=100.0, posinf=100.0, neginf=-100.0)
+        total_loss = torch.clamp(total_loss, min=-10.0, max=10.0)  # FIXED: gradient safety
+
+        return {
+            "loss": total_loss,
+            "L_cls": L_cls.detach(),
+            "L_exp": L_exp.detach(),
+            "L_entropy": L_entropy.detach(),
+            "L_diversity": L_diversity.detach(),
+            "L_class_sep": L_class_sep.detach(),
+        }

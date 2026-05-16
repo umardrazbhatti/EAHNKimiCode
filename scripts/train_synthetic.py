@@ -1,162 +1,225 @@
-"""
-losses/explanation.py — L_exp:
-  * Supervised (has pixel mask): MSE(M_t_avg, gt_mask)
-  * Weak supervision (no mask): α·Entropy(M_t) + β·TV(M_t) + diversity_weight·l_div
-    + class_sep_weight·l_class_sep
-
-CRITICAL FIXES (v3):
- 1. Added epsilon to ALL divisions to prevent division by zero
- 2. Added gradient clipping inside loss to prevent explosion
- 3. Added L_exp warmup support (caller scales lambda1)
- 4. Fixed entropy computation to use log() safely
- 5. Added numerical stability checks with torch.nan_to_num
- 6. Diversity hinge 0.2 → 0.3 (was too aggressive, caused collapse)
- 7. Class-separation hinge 0.05 → 0.1 (less extreme)
-"""
-
+import os
+import sys
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from dataclasses import dataclass
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from typing import Optional
 
-@dataclass
-class ExplanationLossOutput:
-    loss: torch.Tensor
-    l_h: float
-    l_tv: float
-    l_div: float
-    l_class_sep: float
-    inter_sample_sim: float
+# Add project root to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-class ExplanationLoss(nn.Module):
-    def __init__(self, alpha: float = 0.5, beta: float = 0.5,
-                 diversity_weight: float = 2.0,  # REDUCED from 8.0
-                 class_sep_weight: float = 0.5):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.diversity_weight = diversity_weight
-        self.class_sep_weight = class_sep_weight
-        self.eps = 1e-6  # Global epsilon for stability
+from config import EAHNConfig
+from models.eahn import EAHN
+from losses.explanation import ExplanationLoss
+from losses.classification import build_classification_loss
+from data.synthetic_generator import SyntheticDataset
+from utils.checkpointing import save_checkpoint, load_checkpoint
+from metrics.detection import DetectionMetrics
 
-    def forward(
-        self,
-        M_t: torch.Tensor,
-        masks: torch.Tensor,
-        has_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-    ) -> ExplanationLossOutput:
-        B, T, h, w = M_t.shape
 
-        # Initialize loss with proper device/dtype
-        loss = torch.tensor(0.0, device=M_t.device, dtype=M_t.dtype)
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: ExplanationLoss,
+    device: torch.device,
+    epoch: int,
+    lambda1: float,
+    warmup_steps: int = 1000,
+) -> dict:
+    model.train()
+    running_loss = 0.0
+    running_cls = 0.0
+    running_exp = 0.0
+    global_step = epoch * len(dataloader)
 
-        l_h_acc = 0.0
-        l_tv_acc = 0.0
+    pbar = tqdm(dataloader, desc=f"Train Epoch {epoch}")
+    for batch_idx, batch in enumerate(pbar):
+        step = global_step + batch_idx
 
-        for i in range(B):
-            m_avg = M_t[i].mean(0)  # (h, w)
+        frames = batch["frames"].to(device)          # (B, T, C, H, W)
+        labels = batch["label"].to(device)             # (B,)
+        masks = batch.get("mask", None)
+        if masks is not None:
+            masks = masks.to(device)                   # (B, 1, H, W)
 
-            if has_mask[i]:
-                gt = masks[i]
-                # Handle various gt shapes safely
-                if gt.dim() == 2 and gt.shape == (h, w):
-                    pass  # Perfect match
-                elif gt.dim() == 3 and gt.shape[0] == 1:
-                    gt = gt.squeeze(0)
-                    if gt.shape != (h, w):
-                        gt = F.interpolate(
-                            gt.unsqueeze(0).unsqueeze(0).float(),
-                            size=(h, w), mode='bilinear', align_corners=False
-                        ).squeeze()
-                else:
-                    gt = F.interpolate(
-                        gt.unsqueeze(0).unsqueeze(0).float(),
-                        size=(h, w), mode='bilinear', align_corners=False
-                    ).squeeze()
+        B, T, C, H, W = frames.shape
+        # Flatten temporal into batch for frame-level processing
+        frames_flat = frames.view(B * T, C, H, W)
 
-                # Clamp for safety
-                gt = torch.clamp(gt, 0.0, 1.0)
-                m_avg = torch.clamp(m_avg, 0.0, 1.0)
+        optimizer.zero_grad()
 
-                mse = F.mse_loss(m_avg, gt)
-                loss = loss + mse
-            else:
-                # Entropy: encourage peaked attention (not uniform)
-                m_flat = m_avg.flatten()
-                # Safe clamp before log
-                m_flat = torch.clamp(m_flat, self.eps, 1.0 - self.eps)
-                entropy = -(m_flat * torch.log(m_flat)).sum()
-                # Normalize by size so entropy is comparable across resolutions
-                entropy = entropy / (h * w)
+        # Forward
+        outputs = model(frames_flat)  # dict with 'logits', 'attention', etc.
+        logits = outputs["logits"].view(B, T, -1).mean(dim=1).squeeze(-1)  # (B,)
+        attn = outputs["attention"]  # (B*T, 1, H, W)
+        # Pool attention over time
+        attn = attn.view(B, T, 1, H, W).mean(dim=1)  # (B, 1, H, W)
 
-                # Total variation: encourage spatial smoothness
-                tv_h = (M_t[i, :, :, 1:] - M_t[i, :, :, :-1]).abs().mean()
-                tv_w = (M_t[i, :, 1:, :] - M_t[i, :, :-1, :]).abs().mean()
-                tv = (tv_h + tv_w) / 2.0  # Average for stability
+        # L_exp warmup: ramp lambda1 over first N steps
+        lambda1_eff = lambda1 * min(1.0, step / warmup_steps)  # FIXED: warmup
 
-                loss = loss + (self.alpha * entropy + self.beta * tv)
-                l_h_acc += entropy.item()
-                l_tv_acc += tv.item()
+        loss_dict = criterion(logits, labels, attn, masks)
+        loss = loss_dict["loss"]
 
-        # Average over batch
-        loss = loss / max(B, 1)
+        # FIXED: bad loss skip
+        if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 100.0:
+            print(f"[SKIP] Bad loss {loss.item():.4f} at step {step}, skipping batch")
+            optimizer.zero_grad()
+            continue
 
-        # ── Inter-sample diversity (PER-SAMPLE centroids) ────────────────
-        M_per_sample = M_t.mean(dim=1)  # (B, h, w)
-        flat = M_per_sample.reshape(B, h * w)
+        loss.backward()
 
-        # Safe normalization
-        norms = flat.norm(dim=-1, keepdim=True)
-        flat = flat / (norms + self.eps)
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        sim_matrix = flat @ flat.T  # (B, B)
-        eye = torch.eye(B, dtype=torch.bool, device=M_t.device)
-        n_pairs = B * (B - 1)
+        optimizer.step()
 
-        # Mask diagonal, compute mean similarity
-        sim_masked = sim_matrix.masked_fill(eye, 0.0)
-        inter_sample_sim = float(
-            sim_masked.sum().item() / max(n_pairs, 1)
+        running_loss += loss.item()
+        running_cls += loss_dict["L_cls"].item()
+        running_exp += loss_dict["L_exp"].item()
+
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "L_cls": f"{loss_dict['L_cls'].item():.4f}",
+            "L_exp": f"{loss_dict['L_exp'].item():.4f}",
+            "lambda1": f"{lambda1_eff:.3f}",
+        })
+
+    n = len(dataloader)
+    return {
+        "loss": running_loss / n,
+        "L_cls": running_cls / n,
+        "L_exp": running_exp / n,
+    }
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: ExplanationLoss,
+    device: torch.device,
+) -> dict:
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    for batch in tqdm(dataloader, desc="Validate"):
+        frames = batch["frames"].to(device)
+        labels = batch["label"].to(device)
+
+        B, T, C, H, W = frames.shape
+        frames_flat = frames.view(B * T, C, H, W)
+
+        outputs = model(frames_flat)
+        logits = outputs["logits"].view(B, T, -1).mean(dim=1).squeeze(-1)
+        attn = outputs["attention"].view(B, T, 1, H, W).mean(dim=1)
+
+        loss_dict = criterion(logits, labels, attn, None)
+        running_loss += loss_dict["loss"].item()
+
+        probs = torch.sigmoid(logits)
+        all_preds.extend(probs.cpu().numpy().tolist())
+        all_labels.extend(labels.cpu().numpy().tolist())
+
+    metrics = DetectionMetrics()
+    results = metrics.compute(all_preds, all_labels)
+
+    return {
+        "loss": running_loss / len(dataloader),
+        "auc": results.get("auc", 0.0),
+        "ap": results.get("ap", 0.0),
+        "accuracy": results.get("accuracy", 0.0),
+    }
+
+
+def main(cfg: Optional[EAHNConfig] = None):
+    if cfg is None:
+        cfg = EAHNConfig()
+
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    print(f"[Phase 1] Synthetic Pre-training on {device}")
+
+    # Build model
+    model = EAHN(
+        num_classes=cfg.num_classes,
+        backbone=cfg.backbone,
+        temporal_dim=cfg.temporal_dim,
+    ).to(device)
+
+    # FIXED: diversity_weight 8.0 -> 2.0
+    criterion = ExplanationLoss(
+        diversity_weight=cfg.attn_diversity_weight,  # should be 2.0 in config
+        entropy_weight=cfg.attn_entropy_weight,
+        class_sep_weight=cfg.attn_class_sep_weight,
+    )
+
+    # Build datasets
+    train_dataset = SyntheticDataset(
+        root=cfg.synthetic_data_root,
+        num_samples=cfg.synthetic_samples,
+        frames_per_clip=cfg.frames_per_clip,
+        transform=None,  # add your transform
+    )
+    val_dataset = SyntheticDataset(
+        root=cfg.synthetic_data_root,
+        num_samples=cfg.synthetic_val_samples,
+        frames_per_clip=cfg.frames_per_clip,
+        transform=None,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr_phase1,
+        weight_decay=cfg.weight_decay,
+    )
+
+    best_val_loss = float("inf")
+    for epoch in range(1, cfg.epochs_phase1 + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, epoch,
+            lambda1=cfg.lambda1, warmup_steps=1000,
         )
+        print(f"[Epoch {epoch}] Train Loss: {train_metrics['loss']:.4f} | "
+              f"L_cls: {train_metrics['L_cls']:.4f} | L_exp: {train_metrics['L_exp']:.4f}")
 
-        # Diversity loss: penalize if average similarity > hinge
-        # FIX: hinge 0.2 → 0.3 (less aggressive, prevents collapse)
-        l_div_tensor = F.relu(
-            sim_masked.sum() / max(n_pairs, 1) - 0.3
-        )
-        loss = loss + self.diversity_weight * l_div_tensor
+        # FIXED: validate every epoch to catch NaN early
+        val_metrics = validate(model, val_loader, criterion, device)
+        print(f"[Epoch {epoch}] Val Loss: {val_metrics['loss']:.4f} | "
+              f"AUC: {val_metrics['auc']:.4f} | Acc: {val_metrics['accuracy']:.4f}")
 
-        # ── Class-conditional separation ─────────────────────────────────
-        l_class_sep = torch.tensor(0.0, device=M_t.device, dtype=M_t.dtype)
-        if labels is not None and B >= 2:
-            real_mask = (labels == 0)
-            fake_mask = (labels == 1)
-            if real_mask.sum() >= 1 and fake_mask.sum() >= 1:
-                real_cent = flat[real_mask].mean(dim=0, keepdim=True)
-                fake_cent = flat[fake_mask].mean(dim=0, keepdim=True)
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            save_checkpoint(
+                model, optimizer, epoch,
+                filepath=os.path.join(cfg.checkpoint_dir, "best_synthetic.pth"),
+            )
 
-                # Safe cosine similarity
-                real_norm = real_cent.norm(dim=-1, keepdim=True)
-                fake_norm = fake_cent.norm(dim=-1, keepdim=True)
-                real_cent = real_cent / (real_norm + self.eps)
-                fake_cent = fake_cent / (fake_norm + self.eps)
+    # Save final
+    save_checkpoint(
+        model, optimizer, cfg.epochs_phase1,
+        filepath=os.path.join(cfg.checkpoint_dir, "synthetic_final.pth"),
+    )
+    print("[Phase 1] Complete. Saved to", cfg.checkpoint_dir)
 
-                sim = F.cosine_similarity(real_cent, fake_cent, dim=-1)
-                # FIX: hinge 0.05 → 0.1 (less extreme)
-                l_class_sep = F.relu(sim - 0.1)
-                loss = loss + self.class_sep_weight * l_class_sep
 
-        # Final numerical safety
-        loss = torch.nan_to_num(loss, nan=0.0, posinf=10.0, neginf=-10.0)
-        loss = torch.clamp(loss, -10.0, 10.0)
-
-        return ExplanationLossOutput(
-            loss=loss,
-            l_h=l_h_acc / max(B, 1),
-            l_tv=l_tv_acc / max(B, 1),
-            l_div=float(l_div_tensor.item()),
-            l_class_sep=float(l_class_sep.item()),
-            inter_sample_sim=inter_sample_sim,
-        )
+if __name__ == "__main__":
+    main()
